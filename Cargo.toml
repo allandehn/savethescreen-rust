@@ -1,0 +1,13 @@
+[package]
+name = "savethescreen"
+version = "0.1.0"
+edition = "2021"
+description = "Fullscreen shader savers that keep a panel from holding a still image"
+publish = false
+
+[dependencies]
+bytemuck = { version = "1", features = ["derive"] }
+glyphon = "0.12"
+pollster = "0.4"
+wgpu = { version = "30", features = ["glsl"] }
+winit = "0.30"
