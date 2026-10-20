@@ -6,7 +6,7 @@ Open it and you get a shelf of the savers. Each picture is the same shape as the
 
 A set of savers ships with the app. To add another, save a [Shadertoy](https://www.shadertoy.com) `.frag` file in the shader folder and start the app again. The new card joins the same shelf, sorted by name, without a rebuild.
 
-The picture is drawn at 30 frames a second, then stretched to fit. It opens at half the window's pixels. The number keys run from 10% up to the full window, and that choice is remembered for each saver. A slow drift moves the whole frame across the panel, so even a quiet corner does not sit on the same pixels. When the window is covered or minimized, the clock pauses.
+A saver opens at 30 frames a second, and Page Up and Page Down step that pace up to the screen it is on. The picture is then stretched to fit. It also opens at half the window's pixels. The number keys run from 10% up to the full window. Both choices are remembered for each saver. A slow drift moves the whole frame across the panel, so even a quiet corner does not sit on the same pixels. When the window is covered or minimized, the clock pauses.
 
 The browser version of this gallery lives at [savethescreen-html](https://github.com/allanjorch/savethescreen-html).
 
@@ -26,12 +26,13 @@ On this machine, Super+Shift+L opens it. New windows land on workspace 1 and lea
 | h, l, Left, Right | While a saver or its note is open, switch to the previous or next one. |
 | 1–9, 0 | Set detail to 10% through 100% of the window. 0 is the full picture. On the shelf this sets the highlighted card. |
 | Up, Down, or k j | While a saver is running, raise or lower detail by 10%. On the shelf, up and down move a row. |
+| Page Up, Page Down | Step the pace. It starts at 30 fps and stops at this screen. On the shelf this sets the highlighted card. The card under the pointer still plays at 30 fps. |
 | Click, or F | While a saver is running, fullscreen on the current monitor. F toggles. A click enters fullscreen. |
 | Esc, or Q | From a saver or its note, back to the gallery. From the gallery, quit. |
 | ½ | Back to the gallery. On a keyboard without ½, the key just left of 1 does the same. |
 | Wheel | Scroll the gallery when the window is too short for the shelf. |
 
-A saver opens at 50%. The percent on the highlighted card, and on the saver, is the step it will use next time too. That choice is kept in a `quality` file next to the shader folder. On the shelf, a card plays at 30 frames a second while the pointer rests on it. Move the pointer off the card, or out of the window, and the card keeps the frame it had reached. Rest on it again and it continues from that frame. The others stay as they are. Once every visible card has its picture, the shelf rests.
+A saver opens at 50% and 30 frames a second. The percent and the pace on the highlighted card, and on the saver, are what it will use next time too. Both are kept in a `quality` file next to the shader folder. On the shelf, a card plays at 30 frames a second while the pointer rests on it, even when that card remembers a faster pace. Move the pointer off the card, or out of the window, and the card keeps the frame it had reached. Rest on it again and it continues from that frame. The others stay as they are. Once every visible card has its picture, the shelf rests.
 
 The built-in names, in shelf order:
 

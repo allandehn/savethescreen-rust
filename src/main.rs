@@ -18,8 +18,13 @@ use layout::Move;
 use render::{FrameClock, Renderer, Scene};
 use savers::{shader_dir, Saver};
 
+/// Shelf playback stays here. A running saver uses the pace remembered for that card.
 const SAVER_FRAME: Duration = Duration::from_nanos(1_000_000_000 / 30);
 const GALLERY_FRAME: Duration = Duration::from_nanos(1_000_000_000 / 12);
+
+fn pace_interval(fps: u32) -> Duration {
+    Duration::from_nanos(1_000_000_000 / u64::from(fps.max(1)))
+}
 
 enum Mode {
     Gallery,
@@ -95,6 +100,8 @@ struct App {
     selected: usize,
     /// Detail percent for each saver id, from 10 to 100.
     levels: HashMap<String, u8>,
+    /// Pace in frames per second, when it is not the opening 30.
+    paces: HashMap<String, u32>,
     quality_path: PathBuf,
     shader_frame: i32,
     drawn_at: Instant,
@@ -103,7 +110,7 @@ struct App {
 impl App {
     fn frame_interval(&self) -> Option<Duration> {
         match self.mode {
-            Mode::Saver(_) => Some(SAVER_FRAME),
+            Mode::Saver(index) => Some(pace_interval(self.displayed_pace(index))),
             Mode::Hold(_) => None,
             Mode::Gallery => {
                 if self.playing_card().is_some() {
@@ -134,6 +141,7 @@ impl App {
             width,
             height,
             self.scroll,
+            None,
             None,
             None,
             self.screen_aspect(),
@@ -187,6 +195,7 @@ impl App {
             width,
             height,
             self.scroll,
+            None,
             None,
             None,
             self.screen_aspect(),
@@ -253,7 +262,7 @@ impl ApplicationHandler for App {
         match Renderer::new(window.clone(), event_loop, &mut self.savers) {
             Ok(renderer) => {
                 eprintln!(
-                    "savethescreen on {}. Savers draw at 30 fps, from 10% to 100% of the window, opening at 50%. {} loaded.",
+                    "savethescreen on {}. Savers open at 30 fps and 50% of the window. Page Up and Page Down step the pace, up to the screen. {} loaded.",
                     renderer.adapter_name,
                     self.savers.len()
                 );
@@ -308,6 +317,7 @@ impl ApplicationHandler for App {
                         width,
                         height,
                         self.scroll,
+                        None,
                         None,
                         None,
                         self.screen_aspect(),
@@ -370,6 +380,7 @@ impl ApplicationHandler for App {
                             self.scroll,
                             None,
                             None,
+                            None,
                             self.screen_aspect(),
                         );
                         self.scroll = layout.scroll;
@@ -405,6 +416,10 @@ impl ApplicationHandler for App {
                             Move::Up | Move::Down => {}
                         },
                     }
+                    return;
+                }
+                if let Some(up) = pace_key(&event) {
+                    self.step_pace(up);
                     return;
                 }
                 if event.repeat {
@@ -503,6 +518,7 @@ impl App {
                     self.scroll,
                     None,
                     None,
+                    None,
                     aspect,
                 );
                 self.scroll = layout.scroll;
@@ -512,6 +528,7 @@ impl App {
                     Some(self.selected.min(self.savers.len() - 1))
                 };
                 let detail = hover.map(|index| self.level_of(index));
+                let pace = hover.map(|index| self.displayed_pace(index));
                 let playing = layout.hit(self.cursor.0, self.cursor.1).filter(|&index| {
                     self.savers
                         .get(index)
@@ -521,6 +538,7 @@ impl App {
                     hover,
                     scroll: layout.scroll,
                     detail,
+                    pace,
                     playing,
                     aspect,
                 }
@@ -529,6 +547,7 @@ impl App {
                 index,
                 hud_opacity: self.hud.opacity(),
                 detail: self.level_of(index),
+                pace: self.displayed_pace(index),
             },
             Mode::Hold(index) => Scene::Hold { index },
         };
@@ -599,13 +618,69 @@ impl App {
         let percent = savers::snap_quality(percent);
         if self.levels.get(&id).copied() != Some(percent) {
             self.levels.insert(id, percent);
-            if let Err(err) = savers::save_quality(&self.quality_path, &self.levels) {
+            if let Err(err) = savers::save_quality(&self.quality_path, &self.levels, &self.paces) {
                 eprintln!("savethescreen: {}: {err}", self.quality_path.display());
             }
         }
         if matches!(self.mode, Mode::Saver(_)) {
             self.hud.poke(Duration::from_millis(4200));
         }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn refresh_hz(&self) -> Option<u32> {
+        let window = self.window.as_deref()?;
+        let mhz = window
+            .current_monitor()
+            .or_else(|| window.primary_monitor())
+            .and_then(|monitor| monitor.refresh_rate_millihertz());
+        savers::refresh_hz(mhz)
+    }
+
+    /// The pace this card draws at on the monitor it is on now.
+    fn displayed_pace(&self, index: usize) -> u32 {
+        let stored = self
+            .savers
+            .get(index)
+            .and_then(|saver| self.paces.get(&saver.id).copied())
+            .unwrap_or(savers::DEFAULT_PACE);
+        savers::effective_pace(stored, self.refresh_hz())
+    }
+
+    fn step_pace(&mut self, up: bool) {
+        if matches!(self.mode, Mode::Hold(_)) {
+            return;
+        }
+        let index = match self.mode {
+            Mode::Saver(index) => index,
+            Mode::Gallery => self.selected,
+            Mode::Hold(_) => return,
+        };
+        let Some(id) = self
+            .savers
+            .get(index)
+            .and_then(|saver| saver.hold.is_none().then(|| saver.id.clone()))
+        else {
+            return;
+        };
+        let stored = self.paces.get(&id).copied().unwrap_or(savers::DEFAULT_PACE);
+        let next = savers::step_pace(stored, self.refresh_hz(), up);
+        if next != stored {
+            if next == savers::DEFAULT_PACE {
+                self.paces.remove(&id);
+            } else {
+                self.paces.insert(id, next);
+            }
+            if let Err(err) = savers::save_quality(&self.quality_path, &self.levels, &self.paces) {
+                eprintln!("savethescreen: {}: {err}", self.quality_path.display());
+            }
+        }
+        if matches!(self.mode, Mode::Saver(_)) {
+            self.hud.poke(Duration::from_millis(4200));
+        }
+        self.next_frame = Instant::now();
         if let Some(window) = &self.window {
             window.request_redraw();
         }
@@ -676,6 +751,20 @@ fn quality_key(event: &winit::event::KeyEvent) -> Option<u8> {
     }
 }
 
+/// Page Up steps the pace toward the screen. Page Down steps it back toward 30.
+fn pace_key(event: &winit::event::KeyEvent) -> Option<bool> {
+    match event.physical_key {
+        PhysicalKey::Code(KeyCode::PageUp) => return Some(true),
+        PhysicalKey::Code(KeyCode::PageDown) => return Some(false),
+        _ => {}
+    }
+    match &event.logical_key {
+        Key::Named(NamedKey::PageUp) => Some(true),
+        Key::Named(NamedKey::PageDown) => Some(false),
+        _ => None,
+    }
+}
+
 fn is_back_key(event: &winit::event::KeyEvent) -> bool {
     if matches!(event.logical_key, Key::Named(NamedKey::Escape)) {
         return true;
@@ -697,13 +786,14 @@ fn main() {
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
     let quality_path = savers::quality_path();
-    let levels = savers::load_quality(&quality_path);
+    let (levels, paces) = savers::load_quality(&quality_path);
     let mut app = App {
         window: None,
         renderer: None,
         savers: savers::load(),
         shader_dir: shader_dir().display().to_string(),
         levels,
+        paces,
         quality_path,
         mode: Mode::Gallery,
         clock: Clock {

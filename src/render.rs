@@ -99,8 +99,9 @@ struct Image {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TextKey {
-    Gallery(u32, u32, u32, u32, u32, u32, u32),
-    Hud(usize, u32, u32, u32, u32),
+    Gallery(u32, u32, u32, u32, u32, u32, u32, u32),
+    /// The last value is the HUD fade in percent, so code color can fade with the line.
+    Hud(usize, u32, u32, u32, u32, u32, u32),
     Note(usize, u32, u32, u32),
 }
 
@@ -109,6 +110,8 @@ pub enum Scene {
         hover: Option<usize>,
         scroll: f32,
         detail: Option<u8>,
+        /// Pace shown on the highlighted card. The preview itself stays at 30.
+        pace: Option<u32>,
         /// Card under the pointer. That preview plays from its own clock.
         /// The others keep the frame where the pointer left them.
         playing: Option<usize>,
@@ -119,6 +122,7 @@ pub enum Scene {
         index: usize,
         hud_opacity: f32,
         detail: u8,
+        pace: u32,
     },
     /// A shader that did not compile. The note stays still, with no picture.
     Hold { index: usize },
@@ -186,6 +190,8 @@ pub struct Renderer {
     text_buffers: Vec<Buffer>,
     text_runs: Vec<TextRun>,
     text_key: Option<TextKey>,
+    /// Chips behind inline code and wells behind code blocks, in logical pixels.
+    code_chips: Vec<PaintRect>,
 }
 
 impl Renderer {
@@ -437,6 +443,7 @@ impl Renderer {
         let mut font_system = FontSystem::new();
         font_system.db_mut().set_sans_serif_family("Adwaita Sans");
         font_system.db_mut().set_serif_family("C059");
+        font_system.db_mut().set_monospace_family("Adwaita Mono");
         let swash_cache = SwashCache::new();
         let cache = Cache::new(&device);
         let viewport = Viewport::new(&device, &cache);
@@ -494,6 +501,7 @@ impl Renderer {
             text_buffers: Vec::new(),
             text_runs: Vec::new(),
             text_key: None,
+            code_chips: Vec::new(),
         })
     }
 
@@ -543,11 +551,12 @@ impl Renderer {
                 hover,
                 scroll,
                 detail,
+                pace,
                 playing,
                 aspect,
             } => {
                 let layout = layout::gallery(
-                    savers, shader_dir, logical[0], logical[1], scroll, hover, detail, aspect,
+                    savers, shader_dir, logical[0], logical[1], scroll, hover, detail, pace, aspect,
                 );
                 self.update_previews(&mut encoder, &layout.cards, scale, playing, clock, savers);
                 push_rects(&mut rects, &layout.rects, scale);
@@ -590,6 +599,7 @@ impl Renderer {
                     hover.map(|index| index as u32 + 1).unwrap_or(0),
                     u32::from(detail.unwrap_or(0)),
                     quant(aspect * 1000.0),
+                    pace.unwrap_or(0),
                 ));
                 self.paint(
                     encoder,
@@ -606,6 +616,7 @@ impl Renderer {
                 index,
                 hud_opacity,
                 detail,
+                pace,
             } => {
                 // Coming back to the shelf is a new hover, so the card steps on from its still.
                 self.preview_playing = None;
@@ -642,13 +653,15 @@ impl Renderer {
                     quads.push((Blit::Saver, saver_quad(logical, scale, clock.time)));
                 }
                 if hud_opacity > 0.01 {
-                    runs = layout::hud(savers, index, logical[0], logical[1], detail);
+                    runs = layout::hud(savers, index, logical[0], logical[1], detail, pace);
                     text_key = Some(TextKey::Hud(
                         index,
                         quant(logical[0]),
                         quant(logical[1]),
                         quant(scale * 1000.0),
                         u32::from(detail),
+                        pace,
+                        (hud_opacity.clamp(0.0, 1.0) * 100.0).round() as u32,
                     ));
                     text_opacity = hud_opacity;
                 }
@@ -700,7 +713,11 @@ impl Renderer {
         scale: f32,
     ) {
         if let Some(key) = text_key {
-            self.sync_text(key, runs, scale);
+            self.sync_text(key, runs, scale, text_opacity);
+        }
+        let mut rects = rects;
+        if text_key.is_some() && text_opacity > 0.01 {
+            push_code_chips(&mut rects, &self.code_chips, scale, text_opacity);
         }
         let (frame, suboptimal) = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => (frame, false),
@@ -1064,7 +1081,7 @@ impl Renderer {
         }
     }
 
-    fn sync_text(&mut self, key: TextKey, runs: &[TextRun], scale: f32) {
+    fn sync_text(&mut self, key: TextKey, runs: &[TextRun], scale: f32, opacity: f32) {
         if self.text_key == Some(key) {
             return;
         }
@@ -1085,33 +1102,11 @@ impl Renderer {
                 clip: run
                     .clip
                     .map(|[x, y, w, h]| [x * scale, y * scale, w * scale, h * scale]),
+                block: run.block,
             })
             .collect();
-        self.text_buffers.clear();
-        for run in &self.text_runs {
-            let metrics = Metrics::new(run.size, run.line_height.max(run.size));
-            let mut buffer = Buffer::new(&mut self.font_system, metrics);
-            let mut attrs = Attrs::new().family(if run.serif {
-                Family::Name("C059")
-            } else {
-                Family::Name("Adwaita Sans")
-            });
-            if run.italic {
-                attrs = attrs.style(Style::Italic);
-            }
-            if run.tracking != 0.0 {
-                attrs = attrs.letter_spacing(run.tracking);
-            }
-            {
-                let mut borrowed = buffer.borrow_with(&mut self.font_system);
-                borrowed.set_wrap(Wrap::Word);
-                borrowed.set_size(Some(run.w), Some(run.line_height.max(run.size) * 8.0));
-                borrowed.set_text(&run.text, &attrs, Shaping::Advanced, None);
-                // glyphon reads layout_runs(), which stays empty until the buffer is shaped.
-                borrowed.shape_until_scroll(false);
-            }
-            self.text_buffers.push(buffer);
-        }
+        self.text_buffers = shape_runs(&mut self.font_system, &self.text_runs, opacity);
+        self.code_chips = collect_code_chips(&self.text_buffers, &self.text_runs, scale);
     }
 
     fn prepare_text(&mut self, opacity: f32) {
@@ -1541,6 +1536,183 @@ fn rect_layout_attrs() -> [Option<wgpu::VertexBufferLayout<'static>>; 1] {
     })]
 }
 
+/// Glyphs with this metadata are inline code.
+/// A span color replaces the run color, so the fade is baked into that color.
+const CODE_MARK: usize = 1;
+/// Mono at the body size reads larger than the proportional face. This brings it back in line.
+const CODE_SCALE: f32 = 0.80;
+/// A third of an em, drawn in the body face, so a pill does not sit against the next word.
+const CODE_SIDE: &str = "\u{2004}";
+const CODE_INK: [u8; 3] = [0xe7, 0xe1, 0xd5];
+
+fn code_attrs<'a>(attrs: &Attrs<'a>, run: &TextRun, opacity: f32) -> Attrs<'a> {
+    let alpha = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+    attrs
+        .clone()
+        .family(Family::Name("Adwaita Mono"))
+        .color(Color::rgba(CODE_INK[0], CODE_INK[1], CODE_INK[2], alpha))
+        .metrics(Metrics::new(
+            run.size * CODE_SCALE,
+            run.line_height.max(run.size),
+        ))
+}
+
+fn shape_runs(font_system: &mut FontSystem, runs: &[TextRun], opacity: f32) -> Vec<Buffer> {
+    let mut buffers = Vec::with_capacity(runs.len());
+    for run in runs {
+        let metrics = Metrics::new(run.size, run.line_height.max(run.size));
+        let mut buffer = Buffer::new(font_system, metrics);
+        let mut attrs = Attrs::new().family(if run.serif {
+            Family::Name("C059")
+        } else {
+            Family::Name("Adwaita Sans")
+        });
+        if run.italic {
+            attrs = attrs.style(Style::Italic);
+        }
+        if run.tracking != 0.0 {
+            attrs = attrs.letter_spacing(run.tracking);
+        }
+        {
+            let mut borrowed = buffer.borrow_with(font_system);
+            borrowed.set_wrap(Wrap::Word);
+            borrowed.set_size(Some(run.w), Some(run.line_height.max(run.size) * 8.0));
+            if run.block {
+                let code = code_attrs(&attrs, run, opacity);
+                borrowed.set_text(&run.text, &code, Shaping::Advanced, None);
+            } else {
+                let spans = layout::inline_spans(&run.text);
+                if spans.iter().any(|(_, code)| *code) {
+                    let mut rich = Vec::new();
+                    for (text, code) in &spans {
+                        if *code {
+                            rich.push((CODE_SIDE, attrs.clone()));
+                            rich.push((
+                                *text,
+                                code_attrs(&attrs, run, opacity).metadata(CODE_MARK),
+                            ));
+                            rich.push((CODE_SIDE, attrs.clone()));
+                        } else if !text.is_empty() {
+                            rich.push((*text, attrs.clone()));
+                        }
+                    }
+                    borrowed.set_rich_text(rich, &attrs, Shaping::Advanced, None);
+                } else {
+                    borrowed.set_text(&run.text, &attrs, Shaping::Advanced, None);
+                }
+            }
+            // glyphon reads layout_runs(), which stays empty until the buffer is shaped.
+            borrowed.shape_until_scroll(false);
+        }
+        buffers.push(buffer);
+    }
+    buffers
+}
+
+fn collect_code_chips(buffers: &[Buffer], runs: &[TextRun], scale: f32) -> Vec<PaintRect> {
+    let mut chips = Vec::new();
+    if scale <= 0.0 {
+        return chips;
+    }
+    let inv = 1.0 / scale;
+    for (buffer, run) in buffers.iter().zip(runs.iter()) {
+        if run.block {
+            push_code_well(&mut chips, buffer, run, inv);
+        } else {
+            push_inline_chips(&mut chips, buffer, run, inv);
+        }
+    }
+    chips
+}
+
+fn push_inline_chips(chips: &mut Vec<PaintRect>, buffer: &Buffer, run: &TextRun, inv: f32) {
+    for line in buffer.layout_runs() {
+        let mut group: Option<(f32, f32)> = None;
+        for glyph in line.glyphs {
+            if glyph.metadata == CODE_MARK && glyph.w > 0.0 {
+                group = Some(match group {
+                    Some((start, _)) => (start, glyph.x + glyph.w),
+                    None => (glyph.x, glyph.x + glyph.w),
+                });
+            } else if let Some((start, end)) = group.take() {
+                push_inline_chip(chips, run, line.line_y, start, end, inv);
+            }
+        }
+        if let Some((start, end)) = group.take() {
+            push_inline_chip(chips, run, line.line_y, start, end, inv);
+        }
+    }
+}
+
+fn push_inline_chip(
+    chips: &mut Vec<PaintRect>,
+    run: &TextRun,
+    line_y: f32,
+    start: f32,
+    end: f32,
+    inv: f32,
+) {
+    if end <= start {
+        return;
+    }
+    // The pill follows the smaller mono size, with a little air around the letters.
+    let size = run.size * inv * CODE_SCALE;
+    let pad_x = size * 0.36;
+    let baseline = (run.y + line_y) * inv;
+    chips.push(PaintRect {
+        x: (run.x + start) * inv - pad_x,
+        y: baseline - size * 1.02,
+        w: (end - start) * inv + pad_x * 2.0,
+        h: size * 1.30,
+        color: layout::hex(0xece7dc, 0.15),
+        radius: 5.0,
+        mode: 0.0,
+    });
+}
+
+fn push_code_well(chips: &mut Vec<PaintRect>, buffer: &Buffer, run: &TextRun, inv: f32) {
+    let mut top = f32::MAX;
+    let mut bottom = f32::MIN;
+    let mut any = false;
+    for line in buffer.layout_runs() {
+        any = true;
+        top = top.min(line.line_top);
+        bottom = bottom.max(line.line_top + line.line_height);
+    }
+    if !any || bottom <= top {
+        return;
+    }
+    let pad_x = 10.0;
+    let pad_y = 7.0;
+    chips.push(PaintRect {
+        x: run.x * inv - pad_x,
+        y: (run.y + top) * inv - pad_y,
+        w: run.w * inv + pad_x * 2.0,
+        h: (bottom - top) * inv + pad_y * 2.0,
+        color: layout::hex(0xece7dc, 0.08),
+        radius: 8.0,
+        mode: 0.0,
+    });
+}
+
+/// A dark plate keeps the type readable on a bright shader. The wash is the code tint.
+fn push_code_chips(out: &mut Vec<RectVertex>, chips: &[PaintRect], scale: f32, opacity: f32) {
+    if opacity <= 0.01 {
+        return;
+    }
+    for chip in chips {
+        if chip.w <= 0.0 || chip.h <= 0.0 {
+            continue;
+        }
+        let mut plate = *chip;
+        plate.color = BG;
+        plate.color[3] = 0.92 * opacity;
+        let mut wash = *chip;
+        wash.color[3] *= opacity;
+        push_rects(out, &[plate, wash], scale);
+    }
+}
+
 fn push_rects(out: &mut Vec<RectVertex>, rects: &[PaintRect], scale: f32) {
     for rect in rects {
         if rect.w <= 0.0 || rect.h <= 0.0 {
@@ -1825,6 +1997,10 @@ fn turn_line<'a>(err: &str, cited: &'a [Cited]) -> Option<&'a Cited> {
     None
 }
 
+fn fence(code: &str) -> String {
+    format!("```\n{code}\n```")
+}
+
 fn turn_page(line_no: u32, source_line: &str) -> String {
     let quoted = source_line.trim();
     let call = twist_call(quoted);
@@ -1833,31 +2009,35 @@ fn turn_page(line_no: u32, source_line: &str) -> String {
         .map(|(args, _)| args.clone())
         .or_else(|| vec4_on_line(quoted))
         .unwrap_or_else(|| "0, -11, 11, 0".to_string());
+    let helper = format!(
+        "mat2 twist(float a)\n{{\n    vec4 c = cos(a + vec4({vec4}));\n    return mat2(c.xy, c.zw);\n}}"
+    );
     let replacement = if let Some((_, angle)) = &call {
-        format!("On line {line_no}, write twist({angle}) in place of mat2(cos(...)).")
+        format!("On line {line_no}, write `twist({angle})` in place of `mat2(cos(...))`.")
     } else {
         format!(
-            "On line {line_no}, write twist(...) in place of mat2(cos(...)). Put the four numbers from your line into the vec4 above, and pass the rest of the cos to twist."
+            "On line {line_no}, write `twist(...)` in place of `mat2(cos(...))`. Put the four numbers from your line into the `vec4` above, and pass the rest of the `cos` to `twist`."
         )
     };
     let finished = call
         .as_ref()
         .and_then(|(_, angle)| replace_mat2_cos(quoted, angle));
     let shown = if let Some(line) = &finished {
-        format!("The line there now is:\n\n{quoted}\n\nThe line can read:\n\n{line}")
+        format!(
+            "The line there now is:\n\n{}\n\nThe line can read:\n\n{}",
+            fence(quoted),
+            fence(line)
+        )
     } else {
-        format!("The line there now is:\n\n{quoted}")
+        format!("The line there now is:\n\n{}", fence(quoted))
     };
     format!(
         "Line {line_no} writes a turn in a short form this app cannot read. Add the longer form below, save the file, and start the app again.\n\n\
-Add this above mainImage:\n\n\
-mat2 twist(float a)\n\
-{{\n\
-    vec4 c = cos(a + vec4({vec4}));\n\
-    return mat2(c.xy, c.zw);\n\
-}}\n\n\
+Add this above `mainImage`:\n\n\
+{}\n\n\
 {replacement}\n\n\
-{shown}"
+{shown}",
+        fence(&helper)
     )
 }
 
@@ -1889,7 +2069,7 @@ It stopped on line {}:\n\n\
 {}\n\n\
 The full detail is also printed where the app was started.",
             line.number,
-            line.text.trim()
+            fence(line.text.trim())
         ),
         None => "This app could not read this shader, so the card stays on the shelf. It may still run on Shadertoy. The full detail is also printed where the app was started.".to_string(),
     }
@@ -2437,6 +2617,8 @@ Shader validation error: Function [0] 'mainImage' is invalid
         assert!(hold.page.contains("twist(p.z*.1683)"));
         assert!(hold.page.contains("p.xy *= twist(p.z*.1683),"));
         assert!(hold.page.contains("vec4(0, -11, 11, 0)"));
+        assert!(hold.page.contains("`mainImage`"));
+        assert!(hold.page.contains("```"));
         assert!(!hold.page.contains("void mainImage"));
     }
 
@@ -2455,6 +2637,7 @@ Shader validation error
         assert!(!hold.card.to_lowercase().contains("turn"));
         assert!(hold.page.contains("line 12"));
         assert!(hold.page.contains("fragColor = vec4(unknown);"));
+        assert!(hold.page.contains("```"));
         assert!(!hold.page.contains("void mainImage"));
         assert!(hold.page.to_lowercase().contains("shadertoy"));
     }
@@ -2465,5 +2648,104 @@ Shader validation error
         assert!(!hold.card.is_empty());
         assert!(hold.page.to_lowercase().contains("could not read"));
         assert!(hold.page.to_lowercase().contains("shadertoy"));
+    }
+
+    #[test]
+    fn inline_code_is_a_chip_and_a_shader_line_is_a_well() {
+        let mut font_system = FontSystem::new();
+        font_system.db_mut().set_sans_serif_family("Adwaita Sans");
+        font_system.db_mut().set_monospace_family("Adwaita Mono");
+        let runs = vec![
+            TextRun {
+                text: "use `h` and `l`".into(),
+                x: 28.0,
+                y: 20.0,
+                w: 420.0,
+                size: 16.0,
+                line_height: 22.0,
+                color: layout::INK,
+                serif: false,
+                italic: false,
+                tracking: 0.0,
+                clip: None,
+                block: false,
+            },
+            TextRun {
+                text: "mat2 twist(float a) {\n    return mat2(c.xy, c.zw);\n}".into(),
+                x: 48.0,
+                y: 120.0,
+                w: 420.0,
+                size: 16.5,
+                line_height: 22.0,
+                color: layout::INK,
+                serif: false,
+                italic: false,
+                tracking: 0.0,
+                clip: None,
+                block: true,
+            },
+        ];
+        let buffers = shape_runs(&mut font_system, &runs, 1.0);
+        let mut code_glyphs = 0;
+        for glyph in buffers[0].layout_runs().flat_map(|line| line.glyphs) {
+            if glyph.metadata == CODE_MARK {
+                code_glyphs += 1;
+                let color = glyph.color_opt.expect("code color");
+                assert!(
+                    (220..246).contains(&color.r()),
+                    "code should sit a little under white, r {}",
+                    color.r()
+                );
+                assert!(
+                    (11.5..13.5).contains(&glyph.font_size),
+                    "code should sit a step under the 16px body, font {}",
+                    glyph.font_size
+                );
+            }
+        }
+        assert!(
+            code_glyphs > 0,
+            "inline code should shape as its own glyphs"
+        );
+        let faded = shape_runs(&mut font_system, &runs[..1], 0.5);
+        let faded_alpha = faded[0]
+            .layout_runs()
+            .flat_map(|line| line.glyphs)
+            .find_map(|glyph| glyph.color_opt.filter(|_| glyph.metadata == CODE_MARK))
+            .expect("faded code color")
+            .a();
+        assert!(
+            (120..140).contains(&faded_alpha),
+            "code color fades with the HUD, alpha {faded_alpha}"
+        );
+        let chips = collect_code_chips(&buffers, &runs, 1.0);
+        let inline: Vec<_> = chips.iter().filter(|chip| chip.radius < 6.0).collect();
+        let wells: Vec<_> = chips.iter().filter(|chip| chip.radius >= 6.0).collect();
+        assert_eq!(inline.len(), 2, "chips: {chips:?}");
+        assert!(
+            inline[0].w < 48.0,
+            "h chip should hug the letter: {:?}",
+            inline[0]
+        );
+        assert!(
+            inline[1].w < 48.0,
+            "l chip should hug the letter: {:?}",
+            inline[1]
+        );
+        assert!(
+            inline[0].x + inline[0].w < inline[1].x,
+            "the word between h and l should keep the chips apart: {inline:?}"
+        );
+        assert!(
+            (8.0..36.0).contains(&inline[0].y),
+            "chip should sit on the first line, y {} h {}",
+            inline[0].y,
+            inline[0].h
+        );
+        assert!((inline[0].y - inline[1].y).abs() < 1.0);
+        assert_eq!(wells.len(), 1, "wells: {wells:?}");
+        assert!(wells[0].w > 420.0);
+        assert!(wells[0].h > 40.0);
+        assert!(wells[0].y > inline[0].y + inline[0].h);
     }
 }

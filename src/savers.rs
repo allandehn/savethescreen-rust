@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 /// Detail when a saver has not been set. Half the window's pixels.
 pub const DEFAULT_QUALITY: u8 = 50;
+/// Opening pace. Page Up and Page Down step away from this.
+pub const DEFAULT_PACE: u32 = 30;
 
 /// Side length of the noise picture used when a shader asks for a channel.
 /// 256 is the size Clouds and the same family divide by. Green is red
@@ -54,7 +56,7 @@ pub fn shader_dir() -> PathBuf {
     base.join("savethescreen").join("shaders")
 }
 
-/// Remembered detail, beside the shader folder. Each line is `percent id`.
+/// Remembered detail and pace, beside the shader folder. Each line is `percent id`, or `percent pace id` when the pace is not 30.
 pub fn quality_path() -> PathBuf {
     shader_dir()
         .parent()
@@ -67,11 +69,64 @@ pub fn snap_quality(percent: u8) -> u8 {
     stepped.clamp(10, 100) as u8
 }
 
-pub fn load_quality(path: &Path) -> HashMap<String, u8> {
+/// Nearest hertz from a monitor's millihertz report. A missing or tiny report stays unknown.
+pub fn refresh_hz(millihertz: Option<u32>) -> Option<u32> {
+    let mhz = millihertz.filter(|value| *value >= 20_000)?;
+    Some(((mhz + 500) / 1000).clamp(30, 360))
+}
+
+/// Pace stops for this screen: 30, then 60 when the screen is faster, then the screen itself.
+pub fn pace_stops(refresh_hz: Option<u32>) -> Vec<u32> {
+    let cap = refresh_hz.unwrap_or(60).clamp(DEFAULT_PACE, 360);
+    let mut stops = vec![DEFAULT_PACE];
+    if cap > 60 {
+        stops.push(60);
+    }
+    if stops.last().copied() != Some(cap) {
+        stops.push(cap);
+    }
+    stops
+}
+
+/// The rate to draw. A saved pace above this screen uses the screen's top stop.
+pub fn effective_pace(stored: u32, refresh_hz: Option<u32>) -> u32 {
+    let stops = pace_stops(refresh_hz);
+    let cap = stops.last().copied().unwrap_or(DEFAULT_PACE);
+    let limited = stored.clamp(DEFAULT_PACE, cap);
+    stops
+        .iter()
+        .rfind(|stop| **stop <= limited)
+        .copied()
+        .unwrap_or(DEFAULT_PACE)
+}
+
+/// One step of Page Up (`up`) or Page Down. At the top of a slower screen, a higher saved pace stays saved.
+pub fn step_pace(stored: u32, refresh_hz: Option<u32>, up: bool) -> u32 {
+    let stops = pace_stops(refresh_hz);
+    let effective = effective_pace(stored, refresh_hz);
+    let index = stops
+        .iter()
+        .position(|stop| *stop == effective)
+        .unwrap_or(0);
+    let next_index = if up {
+        (index + 1).min(stops.len() - 1)
+    } else {
+        index.saturating_sub(1)
+    };
+    let next = stops[next_index];
+    if next == effective {
+        stored
+    } else {
+        next
+    }
+}
+
+pub fn load_quality(path: &Path) -> (HashMap<String, u8>, HashMap<String, u32>) {
     let Ok(text) = fs::read_to_string(path) else {
-        return HashMap::new();
+        return (HashMap::new(), HashMap::new());
     };
     let mut levels = HashMap::new();
+    let mut paces = HashMap::new();
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -81,29 +136,50 @@ pub fn load_quality(path: &Path) -> HashMap<String, u8> {
         let Some(percent) = parts.next().and_then(|token| token.parse::<u8>().ok()) else {
             continue;
         };
-        let id = parts.collect::<Vec<_>>().join(" ");
+        let rest: Vec<_> = parts.collect();
+        if rest.is_empty() {
+            continue;
+        }
+        let (pace, id) = if rest.len() >= 2 && rest[0].bytes().all(|byte| byte.is_ascii_digit()) {
+            match rest[0].parse::<u32>() {
+                Ok(pace) => (Some(pace), rest[1..].join(" ")),
+                Err(_) => (None, rest.join(" ")),
+            }
+        } else {
+            (None, rest.join(" "))
+        };
         if id.is_empty() {
             continue;
         }
-        levels.insert(id, snap_quality(percent));
+        levels.insert(id.clone(), snap_quality(percent));
+        if let Some(pace) = pace.filter(|pace| *pace != DEFAULT_PACE) {
+            paces.insert(id, pace.clamp(DEFAULT_PACE, 360));
+        }
     }
-    levels
+    (levels, paces)
 }
 
-pub fn save_quality(path: &Path, levels: &HashMap<String, u8>) -> std::io::Result<()> {
+pub fn save_quality(
+    path: &Path,
+    levels: &HashMap<String, u8>,
+    paces: &HashMap<String, u32>,
+) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
         }
     }
-    let mut ids: Vec<_> = levels.keys().collect();
+    let mut ids: Vec<_> = levels.keys().chain(paces.keys()).collect();
     ids.sort();
+    ids.dedup();
     let mut text = String::new();
     for id in ids {
-        let Some(percent) = levels.get(id) else {
-            continue;
-        };
+        let percent = levels.get(id).copied().unwrap_or(DEFAULT_QUALITY);
         text.push_str(&percent.to_string());
+        if let Some(pace) = paces.get(id).copied().filter(|pace| *pace != DEFAULT_PACE) {
+            text.push(' ');
+            text.push_str(&pace.to_string());
+        }
         text.push(' ');
         text.push_str(id);
         text.push('\n');
@@ -264,7 +340,7 @@ pub fn limit_note(kinds: &[Option<ChannelKind>; 4]) -> String {
     let mut sentences = Vec::new();
     if !images.is_empty() {
         sentences.push(format!(
-            "{} a 256 noise picture instead of the picture, buffer, keyboard, or sound it asked for.",
+            "{} a `256` noise picture instead of the picture, buffer, keyboard, or sound it asked for.",
             channel_subject(&images)
         ));
     }
@@ -538,7 +614,7 @@ mod tests {
         let kinds = channel_kinds(source);
         assert_eq!(
             limit_note(&kinds),
-            "Channel 0 reads a 256 noise picture instead of the picture, buffer, keyboard, or sound it asked for."
+            "Channel 0 reads a `256` noise picture instead of the picture, buffer, keyboard, or sound it asked for."
         );
         let wrapped = fragment_source(source);
         assert!(wrapped.contains("uniform texture2D iChannel0Tex;"));
@@ -556,7 +632,7 @@ mod tests {
         let both = "void mainImage(out vec4 fragColor, in vec2 fragCoord) {\n    fragColor = texture(iChannel0, vec2(0.0)) + texture(iChannel2, vec3(0.0));\n}\n";
         assert_eq!(
             limit_note(&channel_kinds(both)),
-            "Channel 0 reads a 256 noise picture instead of the picture, buffer, keyboard, or sound it asked for. Channel 2 reads a stand-in instead of a cubemap."
+            "Channel 0 reads a `256` noise picture instead of the picture, buffer, keyboard, or sound it asked for. Channel 2 reads a stand-in instead of a cubemap."
         );
 
         let comment = "// uses iChannel0\nvoid mainImage(out vec4 fragColor, in vec2 fragCoord) { fragColor = vec4(1.0); }\n";
@@ -577,10 +653,40 @@ mod tests {
         let mut levels = HashMap::new();
         levels.insert("wormhood".to_string(), 20);
         levels.insert("harbor lights".to_string(), 100);
-        save_quality(&path, &levels).unwrap();
-        let loaded = load_quality(&path);
+        let mut paces = HashMap::new();
+        paces.insert("wormhood".to_string(), 120);
+        save_quality(&path, &levels, &paces).unwrap();
+        let (loaded, loaded_paces) = load_quality(&path);
         assert_eq!(loaded.get("wormhood"), Some(&20));
         assert_eq!(loaded.get("harbor lights"), Some(&100));
+        assert_eq!(loaded_paces.get("wormhood"), Some(&120));
+        assert!(loaded_paces.get("harbor lights").is_none());
         let _ = fs::remove_file(&path);
+
+        fs::write(&path, "40 veil\n50 60 harbor lights\n").unwrap();
+        let (loaded, loaded_paces) = load_quality(&path);
+        assert_eq!(loaded.get("veil"), Some(&40));
+        assert!(loaded_paces.get("veil").is_none());
+        assert_eq!(loaded.get("harbor lights"), Some(&50));
+        assert_eq!(loaded_paces.get("harbor lights"), Some(&60));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pace_steps_follow_the_screen() {
+        assert_eq!(refresh_hz(Some(119_880)), Some(120));
+        assert_eq!(refresh_hz(Some(1_000)), None);
+        assert_eq!(pace_stops(Some(120)), vec![30, 60, 120]);
+        assert_eq!(pace_stops(Some(60)), vec![30, 60]);
+        assert_eq!(pace_stops(None), vec![30, 60]);
+        assert_eq!(pace_stops(Some(50)), vec![30, 50]);
+        assert_eq!(step_pace(30, Some(120), true), 60);
+        assert_eq!(step_pace(60, Some(120), true), 120);
+        assert_eq!(step_pace(120, Some(120), true), 120);
+        assert_eq!(step_pace(120, Some(120), false), 60);
+        assert_eq!(effective_pace(120, Some(60)), 60);
+        assert_eq!(step_pace(120, Some(60), true), 120);
+        assert_eq!(step_pace(120, Some(60), false), 30);
+        assert_eq!(effective_pace(30, Some(144)), 30);
     }
 }
