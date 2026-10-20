@@ -9,7 +9,7 @@ use wgpu::util::DeviceExt;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
 
-use crate::layout::{self, CardGeom, PaintRect, TextRun, BG};
+use crate::layout::{self, CardGeom, PaintRect, TextRun};
 use crate::savers::{self, Saver};
 
 const PREVIEW_LONG: f32 = 320.0;
@@ -99,10 +99,12 @@ struct Image {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TextKey {
-    Gallery(u32, u32, u32, u32, u32, u32, u32, u32),
-    /// The last value is the HUD fade in percent, so code color can fade with the line.
-    Hud(usize, u32, u32, u32, u32, u32, u32),
-    Note(usize, u32, u32, u32),
+    /// The last two values are the confirmation card (plus one) and the theme stamp.
+    Gallery(u32, u32, u32, u32, u32, u32, u32, u32, u32, u32),
+    /// The value before the stamp is the HUD fade in percent, so code color can fade with the line.
+    Hud(usize, u32, u32, u32, u32, u32, u32, u32),
+    Note(usize, u32, u32, u32, u32),
+    Help(u32, u32, u32, u32, u32),
 }
 
 pub enum Scene {
@@ -115,8 +117,11 @@ pub enum Scene {
         /// Card under the pointer. That preview plays from its own clock.
         /// The others keep the frame where the pointer left them.
         playing: Option<usize>,
-        /// Monitor width divided by height. The card picture uses this.
+        /// Monitor width divided by height. A running saver fills that screen.
+        /// Shelf pictures stay square.
         aspect: f32,
+        /// Set while Delete is waiting for Enter or Esc.
+        confirm: Option<layout::ConfirmCopy>,
     },
     Saver {
         index: usize,
@@ -126,6 +131,8 @@ pub enum Scene {
     },
     /// A shader that did not compile. The note stays still, with no picture.
     Hold { index: usize },
+    /// The guidelines. The shelf stays where it was.
+    Help { scroll: f32 },
 }
 
 struct ShaderGpu {
@@ -187,6 +194,8 @@ pub struct Renderer {
     viewport: Viewport,
     atlas: TextAtlas,
     text_renderer: TextRenderer,
+    /// Dialog text. A second renderer so the question can paint above the shelf.
+    overlay_text: TextRenderer,
     text_buffers: Vec<Buffer>,
     text_runs: Vec<TextRun>,
     text_key: Option<TextKey>,
@@ -450,6 +459,8 @@ impl Renderer {
         let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
         let text_renderer =
             TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
+        let overlay_text =
+            TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
 
         let _ = device.poll(wgpu::PollType::Poll);
         if let Some(err) = errors.pop().await {
@@ -498,11 +509,102 @@ impl Renderer {
             viewport,
             atlas,
             text_renderer,
+            overlay_text,
             text_buffers: Vec::new(),
             text_runs: Vec::new(),
             text_key: None,
             code_chips: Vec::new(),
         })
+    }
+
+    /// Compile the shelf again after a shader file was removed.
+    pub fn reload_savers(&mut self, savers: &mut Vec<Saver>) -> Result<(), String> {
+        pollster::block_on(self.rebuild(savers))
+    }
+
+    async fn rebuild(&mut self, savers: &mut Vec<Saver>) -> Result<(), String> {
+        let fullscreen = shader(
+            &self.device,
+            "fullscreen",
+            wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("../shaders/fullscreen.wgsl"))),
+        );
+        let pending = std::mem::take(savers);
+        let mut compiled: Vec<Option<Compiled>> = Vec::with_capacity(pending.len());
+        for mut saver in pending {
+            match compile_fragment(&self.device, &fullscreen, &saver.id, &saver.source).await {
+                Ok(shader) => {
+                    compiled.push(Some(shader));
+                    savers.push(saver);
+                }
+                Err(err) => {
+                    let hold = explain_compile(&err);
+                    eprintln!(
+                        "savethescreen: {} ({})\n{}\n\n{err}",
+                        saver.name, saver.origin, hold.page
+                    );
+                    saver.hold = Some(hold);
+                    compiled.push(None);
+                    savers.push(saver);
+                }
+            }
+        }
+        let needs_cube = compiled.iter().flatten().any(|shader| {
+            shader
+                .kinds
+                .iter()
+                .any(|kind| matches!(kind, Some(savers::ChannelKind::Cube)))
+        });
+        if needs_cube && self.stand_in_cube.is_none() {
+            self.stand_in_cube = Some(make_stand_in(&self.device, &self.queue, true));
+        }
+        let globals_size =
+            std::num::NonZeroU64::new(std::mem::size_of::<Globals>() as u64).unwrap();
+        let slots = (compiled.len() + 1).max(1) as u64;
+        let globals = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("globals"),
+            size: self.align * slots,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let shaders: Vec<Option<ShaderGpu>> = compiled
+            .into_iter()
+            .map(|shader| {
+                let shader = shader?;
+                let bind = shader_bind(
+                    &self.device,
+                    &shader.layout,
+                    &globals,
+                    globals_size,
+                    &self.sampler,
+                    &self.stand_in.view,
+                    self.stand_in_cube.as_ref().map(|image| &image.view),
+                    shader.kinds,
+                );
+                Some(ShaderGpu {
+                    pipeline: shader.pipeline,
+                    bind,
+                })
+            })
+            .collect();
+        let count = shaders.len();
+        self.globals = globals;
+        self.shaders = shaders;
+        self.previews = (0..count).map(|_| None).collect();
+        self.preview_clock = vec![
+            CardClock {
+                time: 0.0,
+                frame: 0
+            };
+            count
+        ];
+        self.preview_still = vec![false; count];
+        self.preview_playing = None;
+        self.saver_image = None;
+        self.text_key = None;
+        self.text_buffers.clear();
+        self.text_runs.clear();
+        self.code_chips.clear();
+        Ok(())
     }
 
     pub fn draw(
@@ -554,6 +656,7 @@ impl Renderer {
                 pace,
                 playing,
                 aspect,
+                confirm,
             } => {
                 let layout = layout::gallery(
                     savers, shader_dir, logical[0], logical[1], scroll, hover, detail, pace, aspect,
@@ -590,7 +693,17 @@ impl Renderer {
                     &layout::note_marks(&layout.cards, savers),
                     scale,
                 );
+                push_rects(&mut rects, &layout::bottom_bar_paint(layout.bar), scale);
                 runs = layout.texts;
+                let confirm_key = if confirm.is_some() {
+                    hover.map(|index| index as u32 + 1).unwrap_or(1)
+                } else {
+                    0
+                };
+                let overlay = confirm.as_ref().map(|copy| {
+                    let laid = layout::confirm_overlay(copy, logical[0], logical[1]);
+                    (laid.rects, laid.texts)
+                });
                 text_key = Some(TextKey::Gallery(
                     quant(logical[0]),
                     quant(logical[1]),
@@ -600,6 +713,8 @@ impl Renderer {
                     u32::from(detail.unwrap_or(0)),
                     quant(aspect * 1000.0),
                     pace.unwrap_or(0),
+                    confirm_key,
+                    crate::theme::stamp(),
                 ));
                 self.paint(
                     encoder,
@@ -610,6 +725,7 @@ impl Renderer {
                     text_key,
                     text_opacity,
                     scale,
+                    overlay,
                 );
             }
             Scene::Saver {
@@ -662,6 +778,7 @@ impl Renderer {
                         u32::from(detail),
                         pace,
                         (hud_opacity.clamp(0.0, 1.0) * 100.0).round() as u32,
+                        crate::theme::stamp(),
                     ));
                     text_opacity = hud_opacity;
                 }
@@ -674,6 +791,7 @@ impl Renderer {
                     text_key,
                     text_opacity,
                     scale,
+                    None,
                 );
             }
             Scene::Hold { index } => {
@@ -685,6 +803,7 @@ impl Renderer {
                         quant(logical[0]),
                         quant(logical[1]),
                         quant(scale * 1000.0),
+                        crate::theme::stamp(),
                     ));
                 }
                 self.paint(
@@ -696,6 +815,30 @@ impl Renderer {
                     text_key,
                     text_opacity,
                     scale,
+                    None,
+                );
+            }
+            Scene::Help { scroll } => {
+                self.preview_playing = None;
+                let page = layout::help(shader_dir, logical[0], logical[1], scroll);
+                runs = page.texts;
+                text_key = Some(TextKey::Help(
+                    quant(logical[0]),
+                    quant(logical[1]),
+                    quant(scale * 1000.0),
+                    quant(page.scroll),
+                    crate::theme::stamp(),
+                ));
+                self.paint(
+                    encoder,
+                    rects,
+                    0,
+                    quads,
+                    &runs,
+                    text_key,
+                    text_opacity,
+                    scale,
+                    None,
                 );
             }
         }
@@ -711,6 +854,7 @@ impl Renderer {
         text_key: Option<TextKey>,
         text_opacity: f32,
         scale: f32,
+        overlay: Option<(Vec<PaintRect>, Vec<TextRun>)>,
     ) {
         if let Some(key) = text_key {
             self.sync_text(key, runs, scale, text_opacity);
@@ -719,6 +863,16 @@ impl Renderer {
         if text_key.is_some() && text_opacity > 0.01 {
             push_code_chips(&mut rects, &self.code_chips, scale, text_opacity);
         }
+        // Shelf text paints before this. The dialog's scrim then covers titles and descriptions.
+        let shelf_end = rects.len();
+        let overlay_text = overlay.as_ref().map(|(overlay_rects, overlay_runs)| {
+            let scaled = scale_runs(overlay_runs, scale);
+            let buffers = shape_runs(&mut self.font_system, &scaled, 1.0);
+            let chips = collect_code_chips(&buffers, &scaled, scale);
+            push_rects(&mut rects, overlay_rects, scale);
+            push_code_chips(&mut rects, &chips, scale, 1.0);
+            (buffers, scaled)
+        });
         let (frame, suboptimal) = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => (frame, false),
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => (frame, true),
@@ -758,6 +912,9 @@ impl Renderer {
         );
         if text_key.is_some() && text_opacity > 0.01 {
             self.prepare_text(text_opacity);
+        }
+        if let Some((buffers, scaled)) = overlay_text.as_ref() {
+            self.prepare_overlay(buffers, scaled, 1.0);
         }
 
         if !rects.is_empty() {
@@ -805,7 +962,7 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(gpu_color(BG)),
+                        load: wgpu::LoadOp::Clear(gpu_color(crate::theme::bg())),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -839,16 +996,29 @@ impl Renderer {
                 }
             }
 
-            if gradient_at < rects.len() {
+            if gradient_at < shelf_end {
                 pass.set_pipeline(&self.rect_pipeline);
                 pass.set_bind_group(0, &self.screen_bind, &[]);
                 pass.set_vertex_buffer(0, self.rect_buf.slice(..));
-                pass.draw(gradient_at as u32..rects.len() as u32, 0..1);
+                pass.draw(gradient_at as u32..shelf_end as u32, 0..1);
             }
 
             if text_key.is_some() && text_opacity > 0.01 {
                 let _ = self
                     .text_renderer
+                    .render(&self.atlas, &self.viewport, &mut pass);
+            }
+
+            if shelf_end < rects.len() {
+                pass.set_pipeline(&self.rect_pipeline);
+                pass.set_bind_group(0, &self.screen_bind, &[]);
+                pass.set_vertex_buffer(0, self.rect_buf.slice(..));
+                pass.draw(shelf_end as u32..rects.len() as u32, 0..1);
+            }
+
+            if overlay_text.is_some() {
+                let _ = self
+                    .overlay_text
                     .render(&self.atlas, &self.viewport, &mut pass);
             }
         }
@@ -1086,67 +1256,119 @@ impl Renderer {
             return;
         }
         self.text_key = Some(key);
-        self.text_runs = runs
-            .iter()
-            .map(|run| TextRun {
-                text: run.text.clone(),
-                x: run.x * scale,
-                y: run.y * scale,
-                w: run.w * scale,
-                size: run.size * scale,
-                line_height: run.line_height * scale,
-                color: run.color,
-                serif: run.serif,
-                italic: run.italic,
-                tracking: run.tracking,
-                clip: run
-                    .clip
-                    .map(|[x, y, w, h]| [x * scale, y * scale, w * scale, h * scale]),
-                block: run.block,
-            })
-            .collect();
+        self.text_runs = scale_runs(runs, scale);
         self.text_buffers = shape_runs(&mut self.font_system, &self.text_runs, opacity);
         self.code_chips = collect_code_chips(&self.text_buffers, &self.text_runs, scale);
     }
 
     fn prepare_text(&mut self, opacity: f32) {
-        let areas: Vec<TextArea> = self
-            .text_buffers
-            .iter()
-            .zip(self.text_runs.iter())
-            .map(|(buffer, run)| {
-                let alpha = ((run.color[3] as f32) * opacity).round().clamp(0.0, 255.0) as u8;
-                let (left, top, right, bottom) = match run.clip {
-                    Some([x, y, w, h]) => (x as i32, y as i32, (x + w) as i32, (y + h) as i32),
-                    None => (0, 0, self.config.width as i32, self.config.height as i32),
-                };
-                TextArea {
-                    buffer,
-                    left: run.x,
-                    top: run.y,
-                    scale: 1.0,
-                    bounds: TextBounds {
-                        left,
-                        top,
-                        right,
-                        bottom,
-                    },
-                    default_color: Color::rgba(run.color[0], run.color[1], run.color[2], alpha),
-                    custom_glyphs: &[],
-                }
-            })
-            .collect();
-        if let Err(err) = self.text_renderer.prepare(
+        prepare_renderer(
+            &mut self.text_renderer,
             &self.device,
             &self.queue,
             &mut self.font_system,
             &mut self.atlas,
             &self.viewport,
-            areas,
             &mut self.swash_cache,
-        ) {
-            eprintln!("text: {err}");
-        }
+            self.config.width,
+            self.config.height,
+            &self.text_buffers,
+            &self.text_runs,
+            opacity,
+        );
+    }
+
+    fn prepare_overlay(&mut self, buffers: &[Buffer], runs: &[TextRun], opacity: f32) {
+        prepare_renderer(
+            &mut self.overlay_text,
+            &self.device,
+            &self.queue,
+            &mut self.font_system,
+            &mut self.atlas,
+            &self.viewport,
+            &mut self.swash_cache,
+            self.config.width,
+            self.config.height,
+            buffers,
+            runs,
+            opacity,
+        );
+    }
+}
+
+fn scale_runs(runs: &[TextRun], scale: f32) -> Vec<TextRun> {
+    runs.iter()
+        .map(|run| TextRun {
+            text: run.text.clone(),
+            x: run.x * scale,
+            y: run.y * scale,
+            w: run.w * scale,
+            size: run.size * scale,
+            line_height: run.line_height * scale,
+            color: run.color,
+            serif: run.serif,
+            italic: run.italic,
+            tracking: run.tracking,
+            clip: run
+                .clip
+                .map(|[x, y, w, h]| [x * scale, y * scale, w * scale, h * scale]),
+            block: run.block,
+            center: run.center,
+            align_right: run.align_right,
+            badge: run.badge,
+        })
+        .collect()
+}
+
+fn prepare_renderer(
+    renderer: &mut TextRenderer,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    font_system: &mut FontSystem,
+    atlas: &mut TextAtlas,
+    viewport: &Viewport,
+    swash_cache: &mut SwashCache,
+    screen_w: u32,
+    screen_h: u32,
+    buffers: &[Buffer],
+    runs: &[TextRun],
+    opacity: f32,
+) {
+    let areas: Vec<TextArea> = buffers
+        .iter()
+        .zip(runs.iter())
+        .map(|(buffer, run)| {
+            let alpha = ((run.color[3] as f32) * opacity).round().clamp(0.0, 255.0) as u8;
+            let (left, top, right, bottom) = match run.clip {
+                Some([x, y, w, h]) => (x as i32, y as i32, (x + w) as i32, (y + h) as i32),
+                None => (0, 0, screen_w as i32, screen_h as i32),
+            };
+            TextArea {
+                buffer,
+                left: run.x,
+                top: run.y,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left,
+                    top,
+                    right,
+                    bottom,
+                },
+                default_color: Color::rgba(run.color[0], run.color[1], run.color[2], alpha),
+                custom_glyphs: &[],
+            }
+        })
+        .collect();
+    if let Err(err) = renderer.prepare(
+        device,
+        queue,
+        font_system,
+        atlas,
+        viewport,
+        areas,
+        swash_cache,
+    ) {
+        eprintln!("text: {err}");
     }
 }
 
@@ -1539,18 +1761,23 @@ fn rect_layout_attrs() -> [Option<wgpu::VertexBufferLayout<'static>>; 1] {
 /// Glyphs with this metadata are inline code.
 /// A span color replaces the run color, so the fade is baked into that color.
 const CODE_MARK: usize = 1;
-/// Mono at the body size reads larger than the proportional face. This brings it back in line.
+/// Code sits a step under the body size, in the same face.
 const CODE_SCALE: f32 = 0.80;
 /// A third of an em, drawn in the body face, so a pill does not sit against the next word.
 const CODE_SIDE: &str = "\u{2004}";
-const CODE_INK: [u8; 3] = [0xe7, 0xe1, 0xd5];
 
-fn code_attrs<'a>(attrs: &Attrs<'a>, run: &TextRun, opacity: f32) -> Attrs<'a> {
+fn code_attrs<'a>(attrs: &Attrs<'a>, run: &TextRun, opacity: f32, mono: &'a str) -> Attrs<'a> {
+    let ink = if run.badge {
+        crate::theme::highlight_pair().map(|(_, ink)| ink)
+    } else {
+        None
+    }
+    .unwrap_or_else(crate::theme::code_ink);
     let alpha = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
     attrs
         .clone()
-        .family(Family::Name("Adwaita Mono"))
-        .color(Color::rgba(CODE_INK[0], CODE_INK[1], CODE_INK[2], alpha))
+        .family(Family::Name(mono))
+        .color(Color::rgba(ink[0], ink[1], ink[2], alpha))
         .metrics(Metrics::new(
             run.size * CODE_SCALE,
             run.line_height.max(run.size),
@@ -1558,15 +1785,13 @@ fn code_attrs<'a>(attrs: &Attrs<'a>, run: &TextRun, opacity: f32) -> Attrs<'a> {
 }
 
 fn shape_runs(font_system: &mut FontSystem, runs: &[TextRun], opacity: f32) -> Vec<Buffer> {
+    let ui = crate::theme::ui_font();
+    let mono = crate::theme::mono_font();
     let mut buffers = Vec::with_capacity(runs.len());
     for run in runs {
         let metrics = Metrics::new(run.size, run.line_height.max(run.size));
         let mut buffer = Buffer::new(font_system, metrics);
-        let mut attrs = Attrs::new().family(if run.serif {
-            Family::Name("C059")
-        } else {
-            Family::Name("Adwaita Sans")
-        });
+        let mut attrs = Attrs::new().family(Family::Name(&ui));
         if run.italic {
             attrs = attrs.style(Style::Italic);
         }
@@ -1575,11 +1800,22 @@ fn shape_runs(font_system: &mut FontSystem, runs: &[TextRun], opacity: f32) -> V
         }
         {
             let mut borrowed = buffer.borrow_with(font_system);
-            borrowed.set_wrap(Wrap::Word);
+            let align = if run.center {
+                Some(glyphon::cosmic_text::Align::Center)
+            } else if run.align_right {
+                Some(glyphon::cosmic_text::Align::Right)
+            } else {
+                None
+            };
+            borrowed.set_wrap(if run.center || run.align_right {
+                Wrap::None
+            } else {
+                Wrap::Word
+            });
             borrowed.set_size(Some(run.w), Some(run.line_height.max(run.size) * 8.0));
             if run.block {
-                let code = code_attrs(&attrs, run, opacity);
-                borrowed.set_text(&run.text, &code, Shaping::Advanced, None);
+                let code = code_attrs(&attrs, run, opacity, &mono);
+                borrowed.set_text(&run.text, &code, Shaping::Advanced, align);
             } else {
                 let spans = layout::inline_spans(&run.text);
                 if spans.iter().any(|(_, code)| *code) {
@@ -1589,16 +1825,16 @@ fn shape_runs(font_system: &mut FontSystem, runs: &[TextRun], opacity: f32) -> V
                             rich.push((CODE_SIDE, attrs.clone()));
                             rich.push((
                                 *text,
-                                code_attrs(&attrs, run, opacity).metadata(CODE_MARK),
+                                code_attrs(&attrs, run, opacity, &mono).metadata(CODE_MARK),
                             ));
                             rich.push((CODE_SIDE, attrs.clone()));
                         } else if !text.is_empty() {
                             rich.push((*text, attrs.clone()));
                         }
                     }
-                    borrowed.set_rich_text(rich, &attrs, Shaping::Advanced, None);
+                    borrowed.set_rich_text(rich, &attrs, Shaping::Advanced, align);
                 } else {
-                    borrowed.set_text(&run.text, &attrs, Shaping::Advanced, None);
+                    borrowed.set_text(&run.text, &attrs, Shaping::Advanced, align);
                 }
             }
             // glyphon reads layout_runs(), which stays empty until the buffer is shaped.
@@ -1658,13 +1894,26 @@ fn push_inline_chip(
     // The pill follows the smaller mono size, with a little air around the letters.
     let size = run.size * inv * CODE_SCALE;
     let pad_x = size * 0.36;
+    // A few pixels more above and below the letters, inside the card pill.
+    let pad_y = if run.badge {
+        crate::theme::px(4.0)
+    } else {
+        0.0
+    };
     let baseline = (run.y + line_y) * inv;
+    let color = if run.badge {
+        crate::theme::highlight_pair()
+            .map(|(bg, _)| bg)
+            .unwrap_or_else(crate::theme::code_wash)
+    } else {
+        crate::theme::code_wash()
+    };
     chips.push(PaintRect {
         x: (run.x + start) * inv - pad_x,
-        y: baseline - size * 1.02,
+        y: baseline - size * 1.02 - pad_y,
         w: (end - start) * inv + pad_x * 2.0,
-        h: size * 1.30,
-        color: layout::hex(0xece7dc, 0.15),
+        h: size * 1.30 + pad_y * 2.0,
+        color,
         radius: 5.0,
         mode: 0.0,
     });
@@ -1689,7 +1938,7 @@ fn push_code_well(chips: &mut Vec<PaintRect>, buffer: &Buffer, run: &TextRun, in
         y: (run.y + top) * inv - pad_y,
         w: run.w * inv + pad_x * 2.0,
         h: (bottom - top) * inv + pad_y * 2.0,
-        color: layout::hex(0xece7dc, 0.08),
+        color: crate::theme::code_well(),
         radius: 8.0,
         mode: 0.0,
     });
@@ -1704,11 +1953,16 @@ fn push_code_chips(out: &mut Vec<RectVertex>, chips: &[PaintRect], scale: f32, o
         if chip.w <= 0.0 || chip.h <= 0.0 {
             continue;
         }
-        let mut plate = *chip;
-        plate.color = BG;
-        plate.color[3] = 0.92 * opacity;
         let mut wash = *chip;
         wash.color[3] *= opacity;
+        // A solid highlight color is the pill itself. The dark plate stays under a tint.
+        if wash.color[3] > 0.9 {
+            push_rects(out, &[wash], scale);
+            continue;
+        }
+        let mut plate = *chip;
+        plate.color = crate::theme::bg();
+        plate.color[3] = 0.92 * opacity;
         push_rects(out, &[plate, wash], scale);
     }
 }
@@ -2669,6 +2923,9 @@ Shader validation error
                 tracking: 0.0,
                 clip: None,
                 block: false,
+                center: false,
+                align_right: false,
+                badge: false,
             },
             TextRun {
                 text: "mat2 twist(float a) {\n    return mat2(c.xy, c.zw);\n}".into(),
@@ -2683,6 +2940,9 @@ Shader validation error
                 tracking: 0.0,
                 clip: None,
                 block: true,
+                center: false,
+                align_right: false,
+                badge: false,
             },
         ];
         let buffers = shape_runs(&mut font_system, &runs, 1.0);
@@ -2691,10 +2951,11 @@ Shader validation error
             if glyph.metadata == CODE_MARK {
                 code_glyphs += 1;
                 let color = glyph.color_opt.expect("code color");
-                assert!(
-                    (220..246).contains(&color.r()),
-                    "code should sit a little under white, r {}",
-                    color.r()
+                let ink = crate::theme::code_ink();
+                assert_eq!(
+                    [color.r(), color.g(), color.b()],
+                    [ink[0], ink[1], ink[2]],
+                    "code takes the theme foreground"
                 );
                 assert!(
                     (11.5..13.5).contains(&glyph.font_size),
@@ -2747,5 +3008,68 @@ Shader validation error
         assert!(wells[0].w > 420.0);
         assert!(wells[0].h > 40.0);
         assert!(wells[0].y > inline[0].y + inline[0].h);
+    }
+
+    #[test]
+    fn the_card_pill_is_right_aligned_and_a_little_taller() {
+        let mut font_system = FontSystem::new();
+        font_system.db_mut().set_sans_serif_family("Adwaita Sans");
+        font_system.db_mut().set_monospace_family("Adwaita Mono");
+        let label = "`50% · 30 fps`";
+        let metrics = |badge: bool, align_right: bool, y: f32| TextRun {
+            text: label.into(),
+            x: 40.0,
+            y,
+            w: 280.0,
+            size: 14.5,
+            line_height: 18.0,
+            color: layout::INK,
+            serif: false,
+            italic: false,
+            tracking: 0.0,
+            clip: None,
+            block: false,
+            center: false,
+            align_right,
+            badge,
+        };
+        let runs = vec![metrics(false, false, 20.0), metrics(true, true, 80.0)];
+        let buffers = shape_runs(&mut font_system, &runs, 1.0);
+        let span = |buffer: &Buffer| {
+            let mut left = f32::MAX;
+            let mut right = f32::MIN;
+            for glyph in buffer.layout_runs().flat_map(|line| line.glyphs) {
+                if glyph.w <= 0.0 {
+                    continue;
+                }
+                left = left.min(glyph.x);
+                right = right.max(glyph.x + glyph.w);
+            }
+            (left, right)
+        };
+        let (left_x, _) = span(&buffers[0]);
+        let (badge_left, badge_right) = span(&buffers[1]);
+        assert!(
+            left_x < 4.0,
+            "a plain pill starts at the left of its box, x {left_x}"
+        );
+        assert!(
+            badge_right > 272.0,
+            "the card pill reaches the right edge, right {badge_right}"
+        );
+        assert!(
+            badge_left > 80.0,
+            "the card pill leaves the left of the picture clear, left {badge_left}"
+        );
+        let chips = collect_code_chips(&buffers, &runs, 1.0);
+        assert_eq!(chips.len(), 2, "chips: {chips:?}");
+        let extra = crate::theme::px(4.0) * 2.0;
+        assert!(
+            (chips[1].h - chips[0].h - extra).abs() < 0.6,
+            "badge h {} plain h {} extra {extra}",
+            chips[1].h,
+            chips[0].h
+        );
+        assert!(chips[1].x + chips[1].w > runs[1].x + runs[1].w * 0.6);
     }
 }

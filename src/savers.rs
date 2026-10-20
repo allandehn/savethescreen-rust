@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 /// Detail when a saver has not been set. Half the window's pixels.
@@ -22,7 +23,7 @@ pub enum ChannelKind {
 
 /// Why a shader is on the shelf but not running. The file on disk is left as saved.
 pub struct Hold {
-    /// One or two sentences on the card, in place of the blurb while the card is highlighted.
+    /// Short reason kept with the shader. The shelf shows a corner mark.
     pub card: String,
     /// The still note. Paragraphs are separated by a blank line.
     pub page: String,
@@ -243,7 +244,133 @@ pub(crate) fn load_from(dir: &Path) -> Vec<Saver> {
     }
     savers.extend(added);
     sort_savers(&mut savers);
+    let hidden = removed_ids(dir);
+    if !hidden.is_empty() {
+        savers.retain(|saver| !hidden.contains(&saver.id));
+    }
     savers
+}
+
+fn is_builtin_id(id: &str) -> bool {
+    matches!(
+        id,
+        "veil"
+            | "drift"
+            | "ember"
+            | "bodies"
+            | "shoal"
+            | "gloam"
+            | "cinder"
+            | "murk"
+            | "wisp"
+            | "silt"
+    )
+}
+
+fn removed_path(dir: &Path) -> PathBuf {
+    dir.join("removed")
+}
+
+fn removed_ids(dir: &Path) -> HashSet<String> {
+    let Ok(text) = fs::read_to_string(removed_path(dir)) else {
+        return HashSet::new();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .collect()
+}
+
+fn write_removed(dir: &Path, ids: &HashSet<String>) -> io::Result<()> {
+    let mut lines: Vec<_> = ids.iter().map(String::as_str).collect();
+    lines.sort_unstable();
+    let mut text = String::new();
+    for id in lines {
+        text.push_str(id);
+        text.push('\n');
+    }
+    fs::write(removed_path(dir), text)
+}
+
+/// The shader file in this folder whose name matches the card, if one is there.
+fn drop_in_path(dir: &Path, id: &str) -> Option<PathBuf> {
+    let entries = fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if id_from_path(&path).as_deref() == Some(id) && path.is_file() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// What Delete will do. A file outside the shader folder is never included.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemovalPlan {
+    pub file: Option<PathBuf>,
+    /// A shader that ships with the app is named in `removed` so the shelf leaves it off.
+    pub hide: bool,
+}
+
+pub fn plan_removal(saver: &Saver, dir: &Path) -> RemovalPlan {
+    let file = if saver.origin.starts_with("built-in") {
+        None
+    } else {
+        drop_in_path(dir, &saver.id)
+    };
+    RemovalPlan {
+        file,
+        hide: is_builtin_id(&saver.id),
+    }
+}
+
+/// Heading and body for the shelf's confirmation. The body uses markdown code.
+pub fn confirm_message(saver: &Saver, dir: &Path) -> (String, String) {
+    let plan = plan_removal(saver, dir);
+    let heading = format!("Remove {}?", saver.name);
+    let hint = "`Enter` or `Del` removes it. `Esc` keeps it.";
+    let file_name = plan.file.as_ref().and_then(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+    });
+    let body = match (file_name, plan.hide) {
+        (Some(name), false) => {
+            format!("This deletes `{name}` from the shader folder.\n\n{hint}")
+        }
+        (Some(name), true) => format!(
+            "This deletes `{name}`. {title} also ships with the app, so its name is saved in `removed` and the card stays off the shelf. Delete that line when you want it back.\n\n{hint}",
+            title = saver.name
+        ),
+        (None, true) => format!(
+            "{title} ships with the app. This takes it off the shelf. Its name is saved in `removed`, in the shader folder. Delete that line when you want it back.\n\n{hint}",
+            title = saver.name
+        ),
+        (None, false) => format!("There is no shader file to remove.\n\n`Esc` closes this."),
+    };
+    (heading, body)
+}
+
+/// Deletes the drop-in file and records a shipped shader in `removed`.
+pub fn apply_removal(dir: &Path, id: &str, plan: &RemovalPlan) -> io::Result<()> {
+    if let Some(path) = &plan.file {
+        let root = dir.canonicalize()?;
+        let path = path.canonicalize()?;
+        if !path.starts_with(&root) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "that shader is outside the shader folder",
+            ));
+        }
+        fs::remove_file(path)?;
+    }
+    if plan.hide {
+        let mut ids = removed_ids(dir);
+        ids.insert(id.to_string());
+        write_removed(dir, &ids)?;
+    }
+    Ok(())
 }
 
 fn sort_savers(savers: &mut [Saver]) {
@@ -590,6 +717,68 @@ mod tests {
         assert!(savers.iter().all(|saver| saver.id != "broken"));
         assert!(savers.iter().all(|saver| saver.id != "notes"));
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_removes_a_drop_in_and_can_hide_a_shipped_shader() {
+        let dir = std::env::temp_dir().join(format!(
+            "savethescreen-remove-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("harbor-lights.frag"),
+            "void mainImage(out vec4 fragColor, in vec2 fragCoord) {}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("veil.frag"),
+            "// name: My Veil\nvoid mainImage(out vec4 fragColor, in vec2 fragCoord) {}\n",
+        )
+        .unwrap();
+
+        let savers = load_from(&dir);
+        let harbor = savers
+            .iter()
+            .find(|saver| saver.id == "harbor-lights")
+            .unwrap();
+        let plan = plan_removal(harbor, &dir);
+        assert!(plan.file.is_some());
+        assert!(!plan.hide);
+        let (heading, body) = confirm_message(harbor, &dir);
+        assert!(heading.starts_with("Remove "));
+        assert!(body.contains("`harbor-lights.frag`"));
+        assert!(body.contains("`Esc` keeps it"));
+        apply_removal(&dir, "harbor-lights", &plan).unwrap();
+        assert!(!dir.join("harbor-lights.frag").exists());
+
+        let savers = load_from(&dir);
+        assert!(savers.iter().all(|saver| saver.id != "harbor-lights"));
+        let veil = savers.iter().find(|saver| saver.id == "veil").unwrap();
+        assert_eq!(veil.name, "My Veil");
+        let plan = plan_removal(veil, &dir);
+        assert!(plan.file.is_some());
+        assert!(plan.hide);
+        let (_, body) = confirm_message(veil, &dir);
+        assert!(body.contains("`veil.frag`"));
+        assert!(body.contains("`removed`"));
+        apply_removal(&dir, "veil", &plan).unwrap();
+
+        let savers = load_from(&dir);
+        assert!(savers.iter().all(|saver| saver.id != "veil"));
+        assert!(!dir.join("veil.frag").exists());
+        let listed = fs::read_to_string(dir.join("removed")).unwrap();
+        assert!(listed.lines().any(|line| line == "veil"));
+
+        for saver in builtins() {
+            assert!(is_builtin_id(&saver.id), "{}", saver.id);
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 

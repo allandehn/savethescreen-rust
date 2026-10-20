@@ -1,9 +1,10 @@
 mod layout;
 mod render;
 mod savers;
+mod theme;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -31,6 +32,10 @@ enum Mode {
     Saver(usize),
     /// A still note for a shader that did not compile. Windowed, with no picture.
     Hold(usize),
+    /// Delete was pressed on this shelf card. Enter removes it, Esc keeps it.
+    Confirm(usize),
+    /// The guidelines. `?` or the bottom bar opens this. Esc, Q, or `?` returns.
+    Help,
 }
 
 struct Clock {
@@ -96,6 +101,8 @@ struct App {
     cursor_shown: bool,
     occluded: bool,
     scroll: f32,
+    /// Scroll of the guidelines, kept apart from the shelf.
+    help_scroll: f32,
     /// Highlighted card. Follows the pointer, and the arrow keys and hjkl.
     selected: usize,
     /// Detail percent for each saver id, from 10 to 100.
@@ -111,7 +118,7 @@ impl App {
     fn frame_interval(&self) -> Option<Duration> {
         match self.mode {
             Mode::Saver(index) => Some(pace_interval(self.displayed_pace(index))),
-            Mode::Hold(_) => None,
+            Mode::Hold(_) | Mode::Confirm(_) | Mode::Help => None,
             Mode::Gallery => {
                 if self.playing_card().is_some() {
                     Some(SAVER_FRAME)
@@ -205,8 +212,9 @@ impl App {
             let margin = 18.0;
             if card.y < margin {
                 self.scroll = (self.scroll - (margin - card.y)).max(0.0);
-            } else if card.y + card.span() > height - margin {
-                self.scroll += card.y + card.span() - (height - margin);
+            } else if card.y + card.span() > height - layout::bottom_bar_height() - margin {
+                self.scroll +=
+                    card.y + card.span() - (height - layout::bottom_bar_height() - margin);
             }
         }
         window.request_redraw();
@@ -215,7 +223,7 @@ impl App {
     fn cycle(&mut self, delta: isize) {
         let index = match self.mode {
             Mode::Saver(index) | Mode::Hold(index) => index,
-            Mode::Gallery => return,
+            Mode::Gallery | Mode::Confirm(_) | Mode::Help => return,
         };
         let count = self.savers.len() as isize;
         if count == 0 {
@@ -339,7 +347,7 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if !matches!(self.mode, Mode::Gallery) {
+                if !matches!(self.mode, Mode::Gallery | Mode::Help) {
                     return;
                 }
                 let scale = window.scale_factor() as f32;
@@ -355,7 +363,10 @@ impl ApplicationHandler for App {
                     }
                 };
                 if dy != 0.0 {
-                    self.scroll = (self.scroll - dy).max(0.0);
+                    match self.mode {
+                        Mode::Help => self.help_scroll = (self.help_scroll - dy).max(0.0),
+                        _ => self.scroll = (self.scroll - dy).max(0.0),
+                    }
                     window.request_redraw();
                 }
             }
@@ -370,6 +381,25 @@ impl ApplicationHandler for App {
                     return;
                 }
                 match self.mode {
+                    Mode::Confirm(index) => {
+                        let (width, height) = logical_size(window);
+                        let outside = self.savers.get(index).is_none_or(|saver| {
+                            let (heading, body) =
+                                savers::confirm_message(saver, Path::new(&self.shader_dir));
+                            let overlay = layout::confirm_overlay(
+                                &layout::ConfirmCopy { heading, body },
+                                width,
+                                height,
+                            );
+                            let [x, y, w, h] = overlay.panel;
+                            let (px, py) = self.cursor;
+                            px < x || py < y || px >= x + w || py >= y + h
+                        });
+                        if outside {
+                            self.mode = Mode::Gallery;
+                            window.request_redraw();
+                        }
+                    }
                     Mode::Gallery => {
                         let (width, height) = logical_size(window);
                         let layout = layout::gallery(
@@ -384,10 +414,14 @@ impl ApplicationHandler for App {
                             self.screen_aspect(),
                         );
                         self.scroll = layout.scroll;
-                        if let Some(index) = layout.hit(self.cursor.0, self.cursor.1) {
+                        if layout.bar_contains(self.cursor.0, self.cursor.1) {
+                            self.mode = Mode::Help;
+                            window.request_redraw();
+                        } else if let Some(index) = layout.hit(self.cursor.0, self.cursor.1) {
                             self.open_saver(index);
                         }
                     }
+                    Mode::Help => {}
                     Mode::Saver(_) => {
                         self.hud.poke(Duration::from_millis(2800));
                         if window.fullscreen().is_none() {
@@ -399,6 +433,22 @@ impl ApplicationHandler for App {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state != ElementState::Pressed {
+                    return;
+                }
+                if let Mode::Confirm(index) = self.mode {
+                    if event.repeat {
+                        return;
+                    }
+                    if is_back_key(&event) {
+                        self.mode = Mode::Gallery;
+                        window.request_redraw();
+                        return;
+                    }
+                    if matches!(event.logical_key, Key::Named(NamedKey::Enter))
+                        || is_delete_key(&event)
+                    {
+                        self.remove_shader(index);
+                    }
                     return;
                 }
                 if let Some(movement) = nav_key(&event) {
@@ -415,6 +465,7 @@ impl ApplicationHandler for App {
                             Move::Next => self.cycle(1),
                             Move::Up | Move::Down => {}
                         },
+                        Mode::Confirm(_) | Mode::Help => {}
                     }
                     return;
                 }
@@ -437,17 +488,35 @@ impl ApplicationHandler for App {
                     self.show_gallery();
                     return;
                 }
+                if is_help_key(&event) {
+                    match self.mode {
+                        Mode::Gallery => {
+                            self.mode = Mode::Help;
+                            window.request_redraw();
+                        }
+                        Mode::Help => self.show_gallery(),
+                        _ => {}
+                    }
+                    return;
+                }
                 if let Some(percent) = quality_key(&event) {
                     let index = match self.mode {
                         Mode::Saver(index) | Mode::Hold(index) => index,
                         Mode::Gallery => self.selected,
+                        Mode::Confirm(_) | Mode::Help => return,
                     };
                     self.set_level(index, percent);
                     return;
                 }
                 match self.mode {
                     Mode::Gallery => {
-                        if matches!(event.logical_key, Key::Named(NamedKey::Enter)) {
+                        if is_delete_key(&event)
+                            && !event.repeat
+                            && self.selected < self.savers.len()
+                        {
+                            self.mode = Mode::Confirm(self.selected);
+                            window.request_redraw();
+                        } else if matches!(event.logical_key, Key::Named(NamedKey::Enter)) {
                             self.open_saver(self.selected);
                         }
                     }
@@ -457,7 +526,8 @@ impl ApplicationHandler for App {
                             self.toggle_fullscreen();
                         }
                     }
-                    Mode::Hold(_) => {}
+                    Mode::Hold(_) | Mode::Help => {}
+                    Mode::Confirm(_) => {}
                 }
             }
             WindowEvent::RedrawRequested => self.draw(),
@@ -474,9 +544,13 @@ impl ApplicationHandler for App {
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
         }
+        if theme::reload_if_changed() {
+            window.request_redraw();
+        }
         let now = Instant::now();
         let Some(interval) = self.frame_interval() else {
-            event_loop.set_control_flow(ControlFlow::Wait);
+            // An idle shelf still notices a theme, font, or text-size change.
+            event_loop.set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(400)));
             return;
         };
         if self.next_frame <= now {
@@ -489,6 +563,7 @@ impl ApplicationHandler for App {
 
 impl App {
     fn draw(&mut self) {
+        theme::reload_if_changed();
         let Some(window) = &self.window else {
             return;
         };
@@ -508,8 +583,9 @@ impl App {
         let frame = self.shader_frame;
         self.shader_frame = self.shader_frame.saturating_add(1);
         let scene = match self.mode {
-            Mode::Gallery => {
+            Mode::Gallery | Mode::Confirm(_) => {
                 let aspect = self.screen_aspect();
+                let confirming = matches!(self.mode, Mode::Confirm(_));
                 let layout = layout::gallery(
                     &self.savers,
                     &self.shader_dir,
@@ -525,15 +601,30 @@ impl App {
                 let hover = if self.savers.is_empty() {
                     None
                 } else {
-                    Some(self.selected.min(self.savers.len() - 1))
+                    Some(match self.mode {
+                        Mode::Confirm(index) => index.min(self.savers.len() - 1),
+                        _ => self.selected.min(self.savers.len() - 1),
+                    })
                 };
                 let detail = hover.map(|index| self.level_of(index));
                 let pace = hover.map(|index| self.displayed_pace(index));
-                let playing = layout.hit(self.cursor.0, self.cursor.1).filter(|&index| {
-                    self.savers
-                        .get(index)
-                        .is_some_and(|saver| saver.hold.is_none())
-                });
+                let playing = if confirming {
+                    None
+                } else {
+                    layout.hit(self.cursor.0, self.cursor.1).filter(|&index| {
+                        self.savers
+                            .get(index)
+                            .is_some_and(|saver| saver.hold.is_none())
+                    })
+                };
+                let confirm = match self.mode {
+                    Mode::Confirm(index) => self.savers.get(index).map(|saver| {
+                        let (heading, body) =
+                            savers::confirm_message(saver, Path::new(&self.shader_dir));
+                        layout::ConfirmCopy { heading, body }
+                    }),
+                    _ => None,
+                };
                 Scene::Gallery {
                     hover,
                     scroll: layout.scroll,
@@ -541,6 +632,7 @@ impl App {
                     pace,
                     playing,
                     aspect,
+                    confirm,
                 }
             }
             Mode::Saver(index) => Scene::Saver {
@@ -550,9 +642,16 @@ impl App {
                 pace: self.displayed_pace(index),
             },
             Mode::Hold(index) => Scene::Hold { index },
+            Mode::Help => {
+                let page = layout::help(&self.shader_dir, logical[0], logical[1], self.help_scroll);
+                self.help_scroll = page.scroll;
+                Scene::Help {
+                    scroll: self.help_scroll,
+                }
+            }
         };
         let show_cursor = match self.mode {
-            Mode::Gallery | Mode::Hold(_) => true,
+            Mode::Gallery | Mode::Hold(_) | Mode::Confirm(_) | Mode::Help => true,
             Mode::Saver(_) => self.hud.opacity() > 0.04,
         };
         let Some(renderer) = &mut self.renderer else {
@@ -650,13 +749,13 @@ impl App {
     }
 
     fn step_pace(&mut self, up: bool) {
-        if matches!(self.mode, Mode::Hold(_)) {
+        if matches!(self.mode, Mode::Hold(_) | Mode::Confirm(_) | Mode::Help) {
             return;
         }
         let index = match self.mode {
             Mode::Saver(index) => index,
             Mode::Gallery => self.selected,
-            Mode::Hold(_) => return,
+            Mode::Hold(_) | Mode::Confirm(_) | Mode::Help => return,
         };
         let Some(id) = self
             .savers
@@ -684,6 +783,48 @@ impl App {
         if let Some(window) = &self.window {
             window.request_redraw();
         }
+    }
+
+    fn remove_shader(&mut self, index: usize) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let Some(saver) = self.savers.get(index) else {
+            self.mode = Mode::Gallery;
+            window.request_redraw();
+            return;
+        };
+        let id = saver.id.clone();
+        let dir = PathBuf::from(&self.shader_dir);
+        let plan = savers::plan_removal(saver, &dir);
+        if plan.file.is_none() && !plan.hide {
+            self.mode = Mode::Gallery;
+            window.request_redraw();
+            return;
+        }
+        if let Err(err) = savers::apply_removal(&dir, &id, &plan) {
+            eprintln!("savethescreen: could not remove {id}: {err}");
+            self.mode = Mode::Gallery;
+            window.request_redraw();
+            return;
+        }
+        let mut next = savers::load_from(&dir);
+        if let Some(renderer) = &mut self.renderer {
+            if let Err(err) = renderer.reload_savers(&mut next) {
+                eprintln!("savethescreen: the shelf could not refresh: {err}");
+            }
+        }
+        self.savers = next;
+        if self.savers.is_empty() {
+            self.selected = 0;
+        } else if index >= self.savers.len() {
+            self.selected = self.savers.len() - 1;
+        } else {
+            self.selected = index;
+        }
+        self.mode = Mode::Gallery;
+        window.set_title("Save the Screen");
+        window.request_redraw();
     }
 
     fn nudge_quality(&mut self, delta: i32) {
@@ -765,11 +906,26 @@ fn pace_key(event: &winit::event::KeyEvent) -> Option<bool> {
     }
 }
 
+fn is_delete_key(event: &winit::event::KeyEvent) -> bool {
+    if let PhysicalKey::Code(KeyCode::Delete) = event.physical_key {
+        return true;
+    }
+    matches!(event.logical_key, Key::Named(NamedKey::Delete))
+}
+
 fn is_back_key(event: &winit::event::KeyEvent) -> bool {
     if matches!(event.logical_key, Key::Named(NamedKey::Escape)) {
         return true;
     }
     matches!(&event.logical_key, Key::Character(text) if text.eq_ignore_ascii_case("q"))
+}
+
+fn is_help_key(event: &winit::event::KeyEvent) -> bool {
+    let question = |text: &str| text == "?";
+    if matches!(&event.logical_key, Key::Character(text) if question(text)) {
+        return true;
+    }
+    event.text.as_ref().is_some_and(|text| question(text))
 }
 
 fn is_gallery_key(event: &winit::event::KeyEvent) -> bool {
@@ -802,6 +958,7 @@ fn main() {
             hidden_at: None,
         },
         scroll: 0.0,
+        help_scroll: 0.0,
         hud: Hud {
             hold_until: Instant::now(),
         },
