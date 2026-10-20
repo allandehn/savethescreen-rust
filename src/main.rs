@@ -2,6 +2,8 @@ mod layout;
 mod render;
 mod savers;
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,6 +24,8 @@ const GALLERY_FRAME: Duration = Duration::from_nanos(1_000_000_000 / 12);
 enum Mode {
     Gallery,
     Saver(usize),
+    /// A still note for a shader that did not compile. Windowed, with no picture.
+    Hold(usize),
 }
 
 struct Clock {
@@ -89,16 +93,56 @@ struct App {
     scroll: f32,
     /// Highlighted card. Follows the pointer, and the arrow keys and hjkl.
     selected: usize,
+    /// Detail percent for each saver id, from 10 to 100.
+    levels: HashMap<String, u8>,
+    quality_path: PathBuf,
     shader_frame: i32,
     drawn_at: Instant,
 }
 
 impl App {
-    fn frame_interval(&self) -> Duration {
+    fn frame_interval(&self) -> Option<Duration> {
         match self.mode {
-            Mode::Gallery => GALLERY_FRAME,
-            Mode::Saver(_) => SAVER_FRAME,
+            Mode::Saver(_) => Some(SAVER_FRAME),
+            Mode::Hold(_) => None,
+            Mode::Gallery => {
+                if self.playing_card().is_some() {
+                    Some(SAVER_FRAME)
+                } else if self
+                    .renderer
+                    .as_ref()
+                    .is_none_or(|renderer| renderer.thumbnails_pending())
+                {
+                    Some(GALLERY_FRAME)
+                } else {
+                    None
+                }
+            }
         }
+    }
+
+    /// The card under the pointer, if the shelf is up and the pointer is on one.
+    fn playing_card(&self) -> Option<usize> {
+        if !matches!(self.mode, Mode::Gallery) {
+            return None;
+        }
+        let window = self.window.as_ref()?;
+        let (width, height) = logical_size(window);
+        let laid = layout::gallery(
+            &self.savers,
+            &self.shader_dir,
+            width,
+            height,
+            self.scroll,
+            None,
+            None,
+            self.screen_aspect(),
+        );
+        let index = laid.hit(self.cursor.0, self.cursor.1)?;
+        self.savers
+            .get(index)
+            .is_some_and(|saver| saver.hold.is_none())
+            .then_some(index)
     }
 
     fn show_gallery(&mut self) {
@@ -111,14 +155,22 @@ impl App {
 
     fn open_saver(&mut self, index: usize) {
         let Some(window) = &self.window else { return };
-        if index >= self.savers.len() {
-            return;
-        }
-        self.mode = Mode::Saver(index);
+        let (name, held) = {
+            let Some(saver) = self.savers.get(index) else {
+                return;
+            };
+            (saver.name.clone(), saver.hold.is_some())
+        };
         self.selected = index;
-        self.mouse_live = !self.pointer_down;
-        self.hud.poke(Duration::from_millis(4200));
-        window.set_title(&format!("{} · Save the Screen", self.savers[index].name));
+        if held {
+            window.set_fullscreen(None);
+            self.mode = Mode::Hold(index);
+        } else {
+            self.mode = Mode::Saver(index);
+            self.mouse_live = !self.pointer_down;
+            self.hud.poke(Duration::from_millis(4200));
+        }
+        window.set_title(&format!("{name} · Save the Screen"));
         window.request_redraw();
     }
 
@@ -129,22 +181,32 @@ impl App {
         let (width, height) = logical_size(&window);
         let cols = layout::gallery_cols(width);
         self.selected = layout::step_index(self.selected, self.savers.len(), cols, movement);
-        let laid = layout::gallery(&self.savers, &self.shader_dir, width, height, self.scroll);
+        let laid = layout::gallery(
+            &self.savers,
+            &self.shader_dir,
+            width,
+            height,
+            self.scroll,
+            None,
+            None,
+            self.screen_aspect(),
+        );
         self.scroll = laid.scroll;
         if let Some(card) = laid.cards.iter().find(|card| card.index == self.selected) {
             let margin = 18.0;
             if card.y < margin {
                 self.scroll = (self.scroll - (margin - card.y)).max(0.0);
-            } else if card.y + card.h > height - margin {
-                self.scroll += card.y + card.h - (height - margin);
+            } else if card.y + card.span() > height - margin {
+                self.scroll += card.y + card.span() - (height - margin);
             }
         }
         window.request_redraw();
     }
 
     fn cycle(&mut self, delta: isize) {
-        let Mode::Saver(index) = self.mode else {
-            return;
+        let index = match self.mode {
+            Mode::Saver(index) | Mode::Hold(index) => index,
+            Mode::Gallery => return,
         };
         let count = self.savers.len() as isize;
         if count == 0 {
@@ -191,7 +253,7 @@ impl ApplicationHandler for App {
         match Renderer::new(window.clone(), event_loop, &mut self.savers) {
             Ok(renderer) => {
                 eprintln!(
-                    "savethescreen on {}. Savers draw at 30 fps with a 1600px long edge. {} loaded.",
+                    "savethescreen on {}. Savers draw at 30 fps, from 10% to 100% of the window, opening at 50%. {} loaded.",
                     renderer.adapter_name,
                     self.savers.len()
                 );
@@ -230,6 +292,9 @@ impl ApplicationHandler for App {
                 }
                 window.request_redraw();
             }
+            WindowEvent::Moved(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                window.request_redraw();
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 let scale = window.scale_factor() as f32;
                 if scale > 0.0 {
@@ -237,14 +302,30 @@ impl ApplicationHandler for App {
                 }
                 if matches!(self.mode, Mode::Gallery) {
                     let (width, height) = logical_size(window);
-                    let laid =
-                        layout::gallery(&self.savers, &self.shader_dir, width, height, self.scroll);
+                    let laid = layout::gallery(
+                        &self.savers,
+                        &self.shader_dir,
+                        width,
+                        height,
+                        self.scroll,
+                        None,
+                        None,
+                        self.screen_aspect(),
+                    );
                     if let Some(index) = laid.hit(self.cursor.0, self.cursor.1) {
                         self.selected = index;
                     }
+                    window.request_redraw();
                 }
                 if matches!(self.mode, Mode::Saver(_)) {
                     self.hud.poke(Duration::from_millis(2800));
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                // A point no card contains, so the shelf returns to stills and can rest.
+                self.cursor = (-1.0, -1.0);
+                if matches!(self.mode, Mode::Gallery) {
+                    window.request_redraw();
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -287,6 +368,9 @@ impl ApplicationHandler for App {
                             width,
                             height,
                             self.scroll,
+                            None,
+                            None,
+                            self.screen_aspect(),
                         );
                         self.scroll = layout.scroll;
                         if let Some(index) = layout.hit(self.cursor.0, self.cursor.1) {
@@ -299,6 +383,7 @@ impl ApplicationHandler for App {
                             window.set_fullscreen(Some(Fullscreen::Borderless(None)));
                         }
                     }
+                    Mode::Hold(_) => {}
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
@@ -311,7 +396,12 @@ impl ApplicationHandler for App {
                         Mode::Saver(_) => match movement {
                             Move::Previous => self.cycle(-1),
                             Move::Next => self.cycle(1),
-                            // Up and down are free while a saver is running.
+                            Move::Up => self.nudge_quality(10),
+                            Move::Down => self.nudge_quality(-10),
+                        },
+                        Mode::Hold(_) => match movement {
+                            Move::Previous => self.cycle(-1),
+                            Move::Next => self.cycle(1),
                             Move::Up | Move::Down => {}
                         },
                     }
@@ -321,15 +411,23 @@ impl ApplicationHandler for App {
                     return;
                 }
                 if is_back_key(&event) {
-                    if matches!(self.mode, Mode::Saver(_)) {
-                        self.show_gallery();
-                    } else {
+                    if matches!(self.mode, Mode::Gallery) {
                         event_loop.exit();
+                    } else {
+                        self.show_gallery();
                     }
                     return;
                 }
                 if is_gallery_key(&event) {
                     self.show_gallery();
+                    return;
+                }
+                if let Some(percent) = quality_key(&event) {
+                    let index = match self.mode {
+                        Mode::Saver(index) | Mode::Hold(index) => index,
+                        Mode::Gallery => self.selected,
+                    };
+                    self.set_level(index, percent);
                     return;
                 }
                 match self.mode {
@@ -344,6 +442,7 @@ impl ApplicationHandler for App {
                             self.toggle_fullscreen();
                         }
                     }
+                    Mode::Hold(_) => {}
                 }
             }
             WindowEvent::RedrawRequested => self.draw(),
@@ -361,9 +460,13 @@ impl ApplicationHandler for App {
             return;
         }
         let now = Instant::now();
+        let Some(interval) = self.frame_interval() else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        };
         if self.next_frame <= now {
             window.request_redraw();
-            self.next_frame = now + self.frame_interval();
+            self.next_frame = now + interval;
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame));
     }
@@ -391,12 +494,16 @@ impl App {
         self.shader_frame = self.shader_frame.saturating_add(1);
         let scene = match self.mode {
             Mode::Gallery => {
+                let aspect = self.screen_aspect();
                 let layout = layout::gallery(
                     &self.savers,
                     &self.shader_dir,
                     logical[0],
                     logical[1],
                     self.scroll,
+                    None,
+                    None,
+                    aspect,
                 );
                 self.scroll = layout.scroll;
                 let hover = if self.savers.is_empty() {
@@ -404,18 +511,29 @@ impl App {
                 } else {
                     Some(self.selected.min(self.savers.len() - 1))
                 };
+                let detail = hover.map(|index| self.level_of(index));
+                let playing = layout.hit(self.cursor.0, self.cursor.1).filter(|&index| {
+                    self.savers
+                        .get(index)
+                        .is_some_and(|saver| saver.hold.is_none())
+                });
                 Scene::Gallery {
                     hover,
                     scroll: layout.scroll,
+                    detail,
+                    playing,
+                    aspect,
                 }
             }
             Mode::Saver(index) => Scene::Saver {
                 index,
                 hud_opacity: self.hud.opacity(),
+                detail: self.level_of(index),
             },
+            Mode::Hold(index) => Scene::Hold { index },
         };
         let show_cursor = match self.mode {
-            Mode::Gallery => true,
+            Mode::Gallery | Mode::Hold(_) => true,
             Mode::Saver(_) => self.hud.opacity() > 0.04,
         };
         let Some(renderer) = &mut self.renderer else {
@@ -439,6 +557,17 @@ impl App {
     }
 }
 
+fn monitor_aspect(window: &Window) -> f32 {
+    window
+        .current_monitor()
+        .or_else(|| window.primary_monitor())
+        .map(|monitor| {
+            let size = monitor.size();
+            layout::screen_aspect(size.width as f32, size.height as f32)
+        })
+        .unwrap_or(16.0 / 9.0)
+}
+
 fn logical_size(window: &Window) -> (f32, f32) {
     let size = window.inner_size();
     let scale = window.scale_factor() as f32;
@@ -446,6 +575,50 @@ fn logical_size(window: &Window) -> (f32, f32) {
         return (size.width as f32, size.height as f32);
     }
     (size.width as f32 / scale, size.height as f32 / scale)
+}
+
+impl App {
+    fn screen_aspect(&self) -> f32 {
+        self.window
+            .as_deref()
+            .map(monitor_aspect)
+            .unwrap_or(16.0 / 9.0)
+    }
+
+    fn level_of(&self, index: usize) -> u8 {
+        self.savers
+            .get(index)
+            .and_then(|saver| self.levels.get(&saver.id).copied())
+            .unwrap_or(savers::DEFAULT_QUALITY)
+    }
+
+    fn set_level(&mut self, index: usize, percent: u8) {
+        let Some(id) = self.savers.get(index).map(|saver| saver.id.clone()) else {
+            return;
+        };
+        let percent = savers::snap_quality(percent);
+        if self.levels.get(&id).copied() != Some(percent) {
+            self.levels.insert(id, percent);
+            if let Err(err) = savers::save_quality(&self.quality_path, &self.levels) {
+                eprintln!("savethescreen: {}: {err}", self.quality_path.display());
+            }
+        }
+        if matches!(self.mode, Mode::Saver(_)) {
+            self.hud.poke(Duration::from_millis(4200));
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn nudge_quality(&mut self, delta: i32) {
+        let Mode::Saver(index) = self.mode else {
+            return;
+        };
+        let next = i32::from(self.level_of(index)) + delta;
+        let percent = if next < 10 { 10 } else { next as u8 };
+        self.set_level(index, percent);
+    }
 }
 
 fn nav_key(event: &winit::event::KeyEvent) -> Option<Move> {
@@ -459,6 +632,44 @@ fn nav_key(event: &winit::event::KeyEvent) -> Option<Move> {
             "l" => Some(Move::Next),
             "k" => Some(Move::Up),
             "j" => Some(Move::Down),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn quality_key(event: &winit::event::KeyEvent) -> Option<u8> {
+    let percent = match event.physical_key {
+        PhysicalKey::Code(code) => match code {
+            KeyCode::Digit1 | KeyCode::Numpad1 => Some(10),
+            KeyCode::Digit2 | KeyCode::Numpad2 => Some(20),
+            KeyCode::Digit3 | KeyCode::Numpad3 => Some(30),
+            KeyCode::Digit4 | KeyCode::Numpad4 => Some(40),
+            KeyCode::Digit5 | KeyCode::Numpad5 => Some(50),
+            KeyCode::Digit6 | KeyCode::Numpad6 => Some(60),
+            KeyCode::Digit7 | KeyCode::Numpad7 => Some(70),
+            KeyCode::Digit8 | KeyCode::Numpad8 => Some(80),
+            KeyCode::Digit9 | KeyCode::Numpad9 => Some(90),
+            KeyCode::Digit0 | KeyCode::Numpad0 => Some(100),
+            _ => None,
+        },
+        _ => None,
+    };
+    if percent.is_some() {
+        return percent;
+    }
+    match &event.logical_key {
+        Key::Character(text) => match text.as_str() {
+            "1" => Some(10),
+            "2" => Some(20),
+            "3" => Some(30),
+            "4" => Some(40),
+            "5" => Some(50),
+            "6" => Some(60),
+            "7" => Some(70),
+            "8" => Some(80),
+            "9" => Some(90),
+            "0" => Some(100),
             _ => None,
         },
         _ => None,
@@ -485,11 +696,15 @@ fn is_gallery_key(event: &winit::event::KeyEvent) -> bool {
 fn main() {
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
+    let quality_path = savers::quality_path();
+    let levels = savers::load_quality(&quality_path);
     let mut app = App {
         window: None,
         renderer: None,
         savers: savers::load(),
         shader_dir: shader_dir().display().to_string(),
+        levels,
+        quality_path,
         mode: Mode::Gallery,
         clock: Clock {
             epoch: Instant::now(),
