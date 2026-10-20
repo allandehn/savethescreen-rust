@@ -1,5 +1,4 @@
 // name: Shoal
-// night: false
 // blurb: Pool-floor light, constantly rewriting the highlights.
 
 float hash(vec2 p) {

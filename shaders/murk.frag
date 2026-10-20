@@ -1,5 +1,4 @@
 // name: Murk
-// night: true
 // blurb: Charcoal fog rolling so slowly the black never sits still.
 
 float hash(vec2 p) {

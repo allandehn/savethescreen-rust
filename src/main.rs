@@ -12,6 +12,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
+use layout::Move;
 use render::{FrameClock, Renderer, Scene};
 use savers::{shader_dir, Saver};
 
@@ -86,6 +87,8 @@ struct App {
     cursor_shown: bool,
     occluded: bool,
     scroll: f32,
+    /// Highlighted card. Follows the pointer, and the arrow keys and hjkl.
+    selected: usize,
     shader_frame: i32,
     drawn_at: Instant,
 }
@@ -112,9 +115,30 @@ impl App {
             return;
         }
         self.mode = Mode::Saver(index);
+        self.selected = index;
         self.mouse_live = !self.pointer_down;
         self.hud.poke(Duration::from_millis(4200));
         window.set_title(&format!("{} · Save the Screen", self.savers[index].name));
+        window.request_redraw();
+    }
+
+    fn nudge(&mut self, movement: Move) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let (width, height) = logical_size(&window);
+        let cols = layout::gallery_cols(width);
+        self.selected = layout::step_index(self.selected, self.savers.len(), cols, movement);
+        let laid = layout::gallery(&self.savers, &self.shader_dir, width, height, self.scroll);
+        self.scroll = laid.scroll;
+        if let Some(card) = laid.cards.iter().find(|card| card.index == self.selected) {
+            let margin = 18.0;
+            if card.y < margin {
+                self.scroll = (self.scroll - (margin - card.y)).max(0.0);
+            } else if card.y + card.h > height - margin {
+                self.scroll += card.y + card.h - (height - margin);
+            }
+        }
         window.request_redraw();
     }
 
@@ -211,6 +235,14 @@ impl ApplicationHandler for App {
                 if scale > 0.0 {
                     self.cursor = (position.x as f32 / scale, position.y as f32 / scale);
                 }
+                if matches!(self.mode, Mode::Gallery) {
+                    let (width, height) = logical_size(window);
+                    let laid =
+                        layout::gallery(&self.savers, &self.shader_dir, width, height, self.scroll);
+                    if let Some(index) = laid.hit(self.cursor.0, self.cursor.1) {
+                        self.selected = index;
+                    }
+                }
                 if matches!(self.mode, Mode::Saver(_)) {
                     self.hud.poke(Duration::from_millis(2800));
                 }
@@ -273,35 +305,45 @@ impl ApplicationHandler for App {
                 if event.state != ElementState::Pressed {
                     return;
                 }
-                if let Some(delta) = arrow_delta(&event) {
-                    if matches!(self.mode, Mode::Saver(_)) {
-                        self.cycle(delta);
+                if let Some(movement) = nav_key(&event) {
+                    match self.mode {
+                        Mode::Gallery => self.nudge(movement),
+                        Mode::Saver(_) => match movement {
+                            Move::Previous => self.cycle(-1),
+                            Move::Next => self.cycle(1),
+                            // Up and down are free while a saver is running.
+                            Move::Up | Move::Down => {}
+                        },
                     }
                     return;
                 }
                 if event.repeat {
                     return;
                 }
+                if is_back_key(&event) {
+                    if matches!(self.mode, Mode::Saver(_)) {
+                        self.show_gallery();
+                    } else {
+                        event_loop.exit();
+                    }
+                    return;
+                }
                 if is_gallery_key(&event) {
                     self.show_gallery();
                     return;
                 }
-                if let Some(index) = digit_index(event.physical_key) {
-                    self.open_saver(index);
-                    return;
-                }
-                if !matches!(self.mode, Mode::Saver(_)) {
-                    return;
-                }
-                match event.logical_key {
-                    Key::Character(ref text) if text.eq_ignore_ascii_case("f") => {
-                        self.toggle_fullscreen();
+                match self.mode {
+                    Mode::Gallery => {
+                        if matches!(event.logical_key, Key::Named(NamedKey::Enter)) {
+                            self.open_saver(self.selected);
+                        }
                     }
-                    Key::Named(NamedKey::Escape) => {
-                        window.set_fullscreen(None);
-                        self.hud.poke(Duration::from_millis(2800));
+                    Mode::Saver(_) => {
+                        if matches!(&event.logical_key, Key::Character(text) if text.eq_ignore_ascii_case("f"))
+                        {
+                            self.toggle_fullscreen();
+                        }
                     }
-                    _ => {}
                 }
             }
             WindowEvent::RedrawRequested => self.draw(),
@@ -357,8 +399,13 @@ impl App {
                     self.scroll,
                 );
                 self.scroll = layout.scroll;
+                let hover = if self.savers.is_empty() {
+                    None
+                } else {
+                    Some(self.selected.min(self.savers.len() - 1))
+                };
                 Scene::Gallery {
-                    hover: layout.hit(self.cursor.0, self.cursor.1),
+                    hover,
                     scroll: layout.scroll,
                 }
             }
@@ -401,31 +448,28 @@ fn logical_size(window: &Window) -> (f32, f32) {
     (size.width as f32 / scale, size.height as f32 / scale)
 }
 
-fn digit_index(key: PhysicalKey) -> Option<usize> {
-    let PhysicalKey::Code(code) = key else {
-        return None;
-    };
-    Some(match code {
-        KeyCode::Digit1 => 0,
-        KeyCode::Digit2 => 1,
-        KeyCode::Digit3 => 2,
-        KeyCode::Digit4 => 3,
-        KeyCode::Digit5 => 4,
-        KeyCode::Digit6 => 5,
-        KeyCode::Digit7 => 6,
-        KeyCode::Digit8 => 7,
-        KeyCode::Digit9 => 8,
-        KeyCode::Digit0 => 9,
-        _ => return None,
-    })
-}
-
-fn arrow_delta(event: &winit::event::KeyEvent) -> Option<isize> {
-    match event.logical_key {
-        Key::Named(NamedKey::ArrowRight) => Some(1),
-        Key::Named(NamedKey::ArrowLeft) => Some(-1),
+fn nav_key(event: &winit::event::KeyEvent) -> Option<Move> {
+    match &event.logical_key {
+        Key::Named(NamedKey::ArrowLeft) => Some(Move::Previous),
+        Key::Named(NamedKey::ArrowRight) => Some(Move::Next),
+        Key::Named(NamedKey::ArrowUp) => Some(Move::Up),
+        Key::Named(NamedKey::ArrowDown) => Some(Move::Down),
+        Key::Character(text) => match text.to_ascii_lowercase().as_str() {
+            "h" => Some(Move::Previous),
+            "l" => Some(Move::Next),
+            "k" => Some(Move::Up),
+            "j" => Some(Move::Down),
+            _ => None,
+        },
         _ => None,
     }
+}
+
+fn is_back_key(event: &winit::event::KeyEvent) -> bool {
+    if matches!(event.logical_key, Key::Named(NamedKey::Escape)) {
+        return true;
+    }
+    matches!(&event.logical_key, Key::Character(text) if text.eq_ignore_ascii_case("q"))
 }
 
 fn is_gallery_key(event: &winit::event::KeyEvent) -> bool {
@@ -462,6 +506,7 @@ fn main() {
         mouse_live: true,
         cursor_shown: true,
         occluded: false,
+        selected: 0,
         shader_frame: 0,
         drawn_at: Instant::now(),
     };

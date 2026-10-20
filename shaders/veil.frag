@@ -1,5 +1,4 @@
 // name: Veil
-// night: false
 // blurb: Aurora curtains that keep sliding over a drifting sky.
 
 float hash(vec2 p) {

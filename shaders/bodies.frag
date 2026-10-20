@@ -1,5 +1,4 @@
 // name: Bodies
-// night: false
 // blurb: Soft orbs on wandering paths, covering the whole rectangle.
 
 float hash(vec2 p) {

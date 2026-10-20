@@ -1,5 +1,4 @@
 // name: Wisp
-// night: true
 // blurb: Thin ghost-lights on near-black, stretching as they wander.
 
 float hash(vec2 p) {

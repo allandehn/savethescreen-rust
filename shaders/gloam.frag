@@ -1,5 +1,4 @@
 // name: Gloam
-// night: true
 // blurb: A dim twilight veil. Movement you notice after a breath.
 
 float hash(vec2 p) {

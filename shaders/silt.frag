@@ -1,5 +1,4 @@
 // name: Silt
-// night: true
 // blurb: Deep water at night. Faint caustics and motes, barely there.
 
 float hash(vec2 p) {

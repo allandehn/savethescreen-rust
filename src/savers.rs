@@ -5,7 +5,6 @@ pub struct Saver {
     pub id: String,
     pub name: String,
     pub blurb: String,
-    pub night: bool,
     /// Shadertoy image shader, as written. The renderer wraps this before compiling.
     pub source: String,
     /// Where it came from, for the message printed when it does not compile.
@@ -26,8 +25,8 @@ pub fn shader_dir() -> PathBuf {
     base.join("savethescreen").join("shaders")
 }
 
-/// Built-in savers, then any `.frag` files in `shader_dir`. A file whose name
-/// matches a built-in id replaces that saver. Anything else is added after them.
+/// Built-in savers, plus any `.frag` files in `shader_dir`. A file whose name
+/// matches a built-in id replaces that saver. The list is sorted by card title.
 pub fn load() -> Vec<Saver> {
     let dir = shader_dir();
     if let Err(err) = fs::create_dir_all(&dir) {
@@ -44,6 +43,7 @@ pub(crate) fn load_from(dir: &Path) -> Vec<Saver> {
         Ok(entries) => entries,
         Err(err) => {
             eprintln!("savethescreen: {}: {err}", dir.display());
+            sort_savers(&mut savers);
             return savers;
         }
     };
@@ -79,9 +79,18 @@ pub(crate) fn load_from(dir: &Path) -> Vec<Saver> {
             added.push(saver);
         }
     }
-    added.sort_by(|a, b| a.id.cmp(&b.id));
     savers.extend(added);
+    sort_savers(&mut savers);
     savers
+}
+
+fn sort_savers(savers: &mut [Saver]) {
+    savers.sort_by(|a, b| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.id.cmp(&b.id))
+    });
 }
 
 fn builtins() -> Vec<Saver> {
@@ -124,22 +133,20 @@ fn parse_shader(id: &str, source: &str, origin: String) -> Result<Saver, String>
             "{origin}: a Shadertoy image shader needs mainImage"
         ));
     }
-    let (name, night, blurb) = card(source, id);
+    let (name, blurb) = card(source, id);
     Ok(Saver {
         id: id.to_string(),
         name,
         blurb,
-        night,
         source: source.to_string(),
         origin,
     })
 }
 
-/// Leading `// name:`, `// night:`, and `// blurb:` lines. A Shadertoy paste
-/// with none of these still loads: the card title comes from the file name.
-fn card(source: &str, id: &str) -> (String, bool, String) {
+/// Leading `// name:` and `// blurb:` lines. A Shadertoy paste with none of
+/// these still loads: the card title comes from the file name.
+fn card(source: &str, id: &str) -> (String, String) {
     let mut name = None;
-    let mut night = false;
     let mut blurb = None;
     for line in source.lines() {
         let trimmed = line.trim();
@@ -160,21 +167,12 @@ fn card(source: &str, id: &str) -> (String, bool, String) {
                 }
             }
             "blurb" => blurb = Some(value.trim().to_string()),
-            "night" => night = flag(value),
             _ => {}
         }
     }
     (
         name.unwrap_or_else(|| title_from_id(id)),
-        night,
         blurb.unwrap_or_default(),
-    )
-}
-
-fn flag(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "true" | "yes" | "1" | "night"
     )
 }
 
@@ -270,24 +268,21 @@ mod tests {
         let savers = load_from(&dir);
         let veil = savers.iter().find(|saver| saver.id == "veil").unwrap();
         assert_eq!(veil.name, "Custom Veil");
-        assert!(veil.night);
         assert_eq!(veil.blurb, "Replaced.");
-        assert_eq!(savers.iter().position(|saver| saver.id == "veil"), Some(0));
 
         let harbor = savers
             .iter()
             .find(|saver| saver.id == "harbor-lights")
             .unwrap();
         assert_eq!(harbor.name, "Harbor Lights");
-        assert!(!harbor.night);
         assert!(harbor.blurb.is_empty());
-        assert!(
-            savers
-                .iter()
-                .position(|saver| saver.id == "harbor-lights")
-                .unwrap()
-                > savers.iter().position(|saver| saver.id == "silt").unwrap()
-        );
+        let names: Vec<_> = savers
+            .iter()
+            .map(|saver| saver.name.to_lowercase())
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
         assert!(savers.iter().all(|saver| saver.id != "broken"));
         assert!(savers.iter().all(|saver| saver.id != "notes"));
 

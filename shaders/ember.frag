@@ -1,5 +1,4 @@
 // name: Ember
-// night: false
 // blurb: Slow lava bloom. Heat that never parks in one place.
 
 float hash(vec2 p) {

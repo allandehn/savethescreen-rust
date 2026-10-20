@@ -1,5 +1,4 @@
 // name: Cinder
-// night: true
 // blurb: Coals in the dark. Heat that stays low and keeps drifting.
 
 float hash(vec2 p) {

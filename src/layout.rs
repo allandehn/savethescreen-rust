@@ -74,14 +74,55 @@ impl Layout {
     }
 }
 
-pub fn gallery(savers: &[Saver], shader_dir: &str, win_w: f32, win_h: f32, scroll: f32) -> Layout {
-    let cols: usize = if win_w <= 760.0 {
+pub fn gallery_cols(win_w: f32) -> usize {
+    if win_w <= 760.0 {
         1
     } else if win_w <= 1280.0 {
         3
     } else {
         5
-    };
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum Move {
+    Previous,
+    Next,
+    Up,
+    Down,
+}
+
+/// One step through the shelf. Left and right walk the name order and wrap.
+/// Up and down move a row and stay put at the edge.
+pub fn step_index(index: usize, count: usize, cols: usize, movement: Move) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    let index = index.min(count - 1);
+    let cols = cols.max(1);
+    match movement {
+        Move::Previous => (index as isize - 1).rem_euclid(count as isize) as usize,
+        Move::Next => (index + 1) % count,
+        Move::Up => {
+            if index >= cols {
+                index - cols
+            } else {
+                index
+            }
+        }
+        Move::Down => {
+            let next = index + cols;
+            if next < count {
+                next
+            } else {
+                index
+            }
+        }
+    }
+}
+
+pub fn gallery(savers: &[Saver], shader_dir: &str, win_w: f32, win_h: f32, scroll: f32) -> Layout {
+    let cols = gallery_cols(win_w);
     let margin = if win_w <= 760.0 { 16.0 } else { 24.0 };
     let content_w = (win_w - margin * 2.0).min(1480.0);
     let x0 = (win_w - content_w) * 0.5;
@@ -96,20 +137,12 @@ pub fn gallery(savers: &[Saver], shader_dir: &str, win_w: f32, win_h: f32, scrol
     let wide = win_w > 1280.0;
     let title_size = (win_w * 0.046).clamp(38.0, 70.0);
 
-    let day: Vec<usize> = savers
-        .iter()
-        .enumerate()
-        .filter(|(_, saver)| !saver.night)
-        .map(|(i, _)| i)
-        .collect();
-    let night: Vec<usize> = savers
-        .iter()
-        .enumerate()
-        .filter(|(_, saver)| saver.night)
-        .map(|(i, _)| i)
-        .collect();
+    let order: Vec<usize> = (0..savers.len()).collect();
 
     let group_h = |count: usize| -> f32 {
+        if count == 0 {
+            return 0.0;
+        }
         let rows = count.div_ceil(cols) as f32;
         rows * card_h + (rows - 1.0).max(0.0) * gap
     };
@@ -119,22 +152,15 @@ pub fn gallery(savers: &[Saver], shader_dir: &str, win_w: f32, win_h: f32, scrol
     } else {
         22.0 + title_size + 12.0 + lede_h + 16.0
     };
-    let footer_h = 168.0;
+    let footer_h = 220.0;
     let mut content_h = header_h;
-    if !day.is_empty() {
-        content_h += group_h(day.len());
-    }
-    if !night.is_empty() {
-        if !day.is_empty() {
-            content_h += 22.0;
-        }
-        content_h += 26.0 + group_h(night.len());
-    }
-    if day.is_empty() && night.is_empty() {
+    if savers.is_empty() {
         content_h += 48.0;
+    } else {
+        content_h += group_h(savers.len());
     }
     content_h += 22.0 + footer_h;
-    // A tiled window is often shorter than two groups of cards. Scroll instead of clipping Night.
+    // A short window scrolls instead of clipping the last row.
     let max_scroll = (content_h + 32.0 - win_h).max(0.0);
     let scroll = if max_scroll == 0.0 {
         0.0
@@ -174,7 +200,7 @@ pub fn gallery(savers: &[Saver], shader_dir: &str, win_w: f32, win_h: f32, scrol
         None,
     ));
 
-    let lede = "Open one, press F, and let it run. Walking color is what keeps a panel from holding a ghost of your last window. ½ brings you back here.";
+    let lede = "Open one, press F, and let it run. Walking color is what keeps a panel from holding a ghost of your last window. Esc or Q brings you back here.";
     if wide {
         let lede_w = 520.0_f32.min(content_w * 0.46);
         texts.push(run(
@@ -217,7 +243,7 @@ pub fn gallery(savers: &[Saver], shader_dir: &str, win_w: f32, win_h: f32, scrol
         mode: 0.0,
     });
 
-    if day.is_empty() && night.is_empty() {
+    if order.is_empty() {
         texts.push(run(
             "No savers loaded.",
             x0,
@@ -232,28 +258,15 @@ pub fn gallery(savers: &[Saver], shader_dir: &str, win_w: f32, win_h: f32, scrol
             None,
         ));
         y += 48.0;
-    }
-    if !day.is_empty() {
+    } else {
         y = place_group(
-            savers, &day, x0, y, cols, card_w, card_h, gap, &mut cards, &mut texts,
-        );
-    }
-    if !night.is_empty() {
-        if !day.is_empty() {
-            y += 22.0;
-        }
-        texts.push(run(
-            "NIGHT", x0, y, content_w, 11.5, 16.0, AMBER, false, false, 0.18, None,
-        ));
-        y += 26.0;
-        y = place_group(
-            savers, &night, x0, y, cols, card_w, card_h, gap, &mut cards, &mut texts,
+            savers, &order, x0, y, cols, card_w, card_h, gap, &mut cards, &mut texts,
         );
     }
 
     y += 22.0;
     let footer = format!(
-        "This panel is IPS Black, so OLED-style burn-in is unlikely — a bright static window can still leave a faint afterimage. Every pixel here keeps moving, plus a slow whole-frame wander. Open a card, then click or press F for fullscreen. Keys 1–0 jump to a saver, the arrow keys move through the list, and ½ returns here. A new saver is a Shadertoy .frag file in {shader_dir}: start the app again and it joins the shelf."
+        "This panel is IPS Black, so OLED-style burn-in is unlikely — a bright static window can still leave a faint afterimage. Every pixel here keeps moving, plus a slow whole-frame wander. Arrow keys and hjkl move through the shelf, and Enter opens the highlighted card. From a saver, h and l (or left and right) switch to the previous or next one, and Esc or Q returns here. From this gallery, Esc or Q quits. A new saver is a Shadertoy .frag file in {shader_dir}: start the app again and it joins the shelf, sorted by name."
     );
     texts.push(run(
         &footer,
@@ -315,23 +328,8 @@ fn place_group(
                     .ceil()
                     .clamp(1.0, 4.0)
             };
-            let block = 16.0 + 4.0 + name_size + 4.0 + lines * 18.0;
+            let block = name_size + if lines > 0.0 { 4.0 + lines * 18.0 } else { 0.0 };
             let mut ty = y + card_h - pad - block;
-            let number = format!("{:02}", index + 1);
-            texts.push(run(
-                &number,
-                x + pad,
-                ty,
-                card_w - pad * 2.0,
-                11.0,
-                14.0,
-                AMBER,
-                false,
-                false,
-                0.14,
-                clip,
-            ));
-            ty += 16.0;
             texts.push(run(
                 &saver.name,
                 x + pad,
@@ -404,7 +402,7 @@ pub fn hud(savers: &[Saver], index: usize, win_w: f32, win_h: f32) -> Vec<TextRu
             None,
         ),
         run(
-            "Click or press F for fullscreen  ·  arrows or 1–0 to switch  ·  ½ back to the gallery",
+            "Click or F for fullscreen  ·  h l or arrows switch  ·  Esc or Q back",
             left,
             hint_y,
             width,
@@ -502,4 +500,22 @@ pub fn wander(time_s: f32) -> (f32, f32) {
     let u = ((t - t0) / (t1 - t0)).clamp(0.0, 1.0);
     let s = u * u * (3.0 - 2.0 * u);
     (x0 + (x1 - x0) * s, y0 + (y1 - y0) * s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn steps_walk_the_grid() {
+        assert_eq!(step_index(0, 10, 5, Move::Next), 1);
+        assert_eq!(step_index(4, 10, 5, Move::Next), 5);
+        assert_eq!(step_index(0, 10, 5, Move::Previous), 9);
+        assert_eq!(step_index(9, 10, 5, Move::Next), 0);
+        assert_eq!(step_index(6, 10, 5, Move::Up), 1);
+        assert_eq!(step_index(2, 10, 5, Move::Up), 2);
+        assert_eq!(step_index(3, 10, 5, Move::Down), 8);
+        assert_eq!(step_index(8, 10, 5, Move::Down), 8);
+        assert_eq!(step_index(0, 0, 5, Move::Next), 0);
+    }
 }

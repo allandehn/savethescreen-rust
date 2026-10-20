@@ -1,5 +1,4 @@
 // name: Drift
-// night: false
 // blurb: Ink in water. Filaments crawl so no region sits still.
 
 float hash(vec2 p) {
