@@ -1,11 +1,6 @@
-#version 450
-layout(location = 0) out vec4 o_color;
-
-layout(set = 0, binding = 0) uniform Globals {
-    vec2 u_res;
-    float u_time;
-    float _pad;
-};
+// name: Veil
+// night: false
+// blurb: Aurora curtains that keep sliding over a drifting sky.
 
 float hash(vec2 p) {
   return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
@@ -33,11 +28,11 @@ float fbm(vec2 p) {
   return v;
 }
 
-void main() {
-  vec2 uv = gl_FragCoord.xy / u_res.xy;
-  float aspect = u_res.x / u_res.y;
+void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+  vec2 uv = vec2(fragCoord.x / iResolution.x, 1.0 - fragCoord.y / iResolution.y);
+  float aspect = iResolution.x / iResolution.y;
   vec2 p = vec2(uv.x * aspect, uv.y);
-  float t = u_time * 0.07;
+  float t = iTime * 0.07;
 
   p += 0.06 * vec2(sin(t * 0.37), cos(t * 0.29));
 
@@ -48,7 +43,7 @@ void main() {
   vec2 sf = fract(sp) - 0.5;
   float sh = hash(floor(sp));
   float star = smoothstep(0.035, 0.0, length(sf)) * smoothstep(0.86, 0.98, sh);
-  star *= 0.45 + 0.55 * sin(u_time * (1.5 + sh * 3.4) + sh * 20.0);
+  star *= 0.45 + 0.55 * sin(iTime * (1.5 + sh * 3.4) + sh * 20.0);
   col += vec3(0.85, 0.9, 1.0) * star;
 
   for (int k = 0; k < 3; k++) {
@@ -71,6 +66,6 @@ void main() {
     col += pal * curtain * (0.85 - fk * 0.12);
   }
 
-  col += (hash(gl_FragCoord.xy + vec2(u_time * 11.0, u_time * 7.0)) - 0.5) * 0.02;
-  o_color = vec4(col, 1.0);
+  col += (hash(vec2(fragCoord.x, iResolution.y - fragCoord.y) + vec2(iTime * 11.0, iTime * 7.0)) - 0.5) * 0.02;
+  fragColor = vec4(col, 1.0);
 }

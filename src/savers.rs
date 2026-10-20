@@ -1,91 +1,309 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+
 pub struct Saver {
-    pub id: &'static str,
-    pub name: &'static str,
-    pub number: &'static str,
-    pub blurb: &'static str,
+    pub id: String,
+    pub name: String,
+    pub blurb: String,
     pub night: bool,
-    pub source: &'static str,
+    /// Shadertoy image shader, as written. The renderer wraps this before compiling.
+    pub source: String,
+    /// Where it came from, for the message printed when it does not compile.
+    pub origin: String,
 }
 
-pub const SAVERS: &[Saver] = &[
-    Saver {
-        id: "veil",
-        name: "Veil",
-        number: "01",
-        blurb: "Aurora curtains that keep sliding over a drifting sky.",
-        night: false,
-        source: include_str!("../shaders/veil.frag"),
-    },
-    Saver {
-        id: "drift",
-        name: "Drift",
-        number: "02",
-        blurb: "Ink in water. Filaments crawl so no region sits still.",
-        night: false,
-        source: include_str!("../shaders/drift.frag"),
-    },
-    Saver {
-        id: "ember",
-        name: "Ember",
-        number: "03",
-        blurb: "Slow lava bloom. Heat that never parks in one place.",
-        night: false,
-        source: include_str!("../shaders/ember.frag"),
-    },
-    Saver {
-        id: "bodies",
-        name: "Bodies",
-        number: "04",
-        blurb: "Soft orbs on wandering paths, covering the whole rectangle.",
-        night: false,
-        source: include_str!("../shaders/bodies.frag"),
-    },
-    Saver {
-        id: "shoal",
-        name: "Shoal",
-        number: "05",
-        blurb: "Pool-floor light, constantly rewriting the highlights.",
-        night: false,
-        source: include_str!("../shaders/shoal.frag"),
-    },
-    Saver {
-        id: "gloam",
-        name: "Gloam",
-        number: "06",
-        blurb: "A dim twilight veil. Movement you notice after a breath.",
-        night: true,
-        source: include_str!("../shaders/gloam.frag"),
-    },
-    Saver {
-        id: "cinder",
-        name: "Cinder",
-        number: "07",
-        blurb: "Coals in the dark. Heat that stays low and keeps drifting.",
-        night: true,
-        source: include_str!("../shaders/cinder.frag"),
-    },
-    Saver {
-        id: "murk",
-        name: "Murk",
-        number: "08",
-        blurb: "Charcoal fog rolling so slowly the black never sits still.",
-        night: true,
-        source: include_str!("../shaders/murk.frag"),
-    },
-    Saver {
-        id: "wisp",
-        name: "Wisp",
-        number: "09",
-        blurb: "Thin ghost-lights on near-black, stretching as they wander.",
-        night: true,
-        source: include_str!("../shaders/wisp.frag"),
-    },
-    Saver {
-        id: "silt",
-        name: "Silt",
-        number: "10",
-        blurb: "Deep water at night. Faint caustics and motes, barely there.",
-        night: true,
-        source: include_str!("../shaders/silt.frag"),
-    },
-];
+pub fn shader_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("SAVETHESCREEN_SHADERS") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .unwrap_or_else(|| PathBuf::from(".config"));
+    base.join("savethescreen").join("shaders")
+}
+
+/// Built-in savers, then any `.frag` files in `shader_dir`. A file whose name
+/// matches a built-in id replaces that saver. Anything else is added after them.
+pub fn load() -> Vec<Saver> {
+    let dir = shader_dir();
+    if let Err(err) = fs::create_dir_all(&dir) {
+        eprintln!("savethescreen: shader folder {}: {err}", dir.display());
+    } else {
+        eprintln!("savethescreen: drop a shader in {}", dir.display());
+    }
+    load_from(&dir)
+}
+
+pub(crate) fn load_from(dir: &Path) -> Vec<Saver> {
+    let mut savers = builtins();
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            eprintln!("savethescreen: {}: {err}", dir.display());
+            return savers;
+        }
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| id_from_path(path).is_some())
+        .collect();
+    paths.sort();
+
+    let mut added = Vec::new();
+    for path in paths {
+        let Some(id) = id_from_path(&path) else {
+            continue;
+        };
+        let source = match fs::read_to_string(&path) {
+            Ok(source) => source,
+            Err(err) => {
+                eprintln!("savethescreen: skipped {}: {err}", path.display());
+                continue;
+            }
+        };
+        let saver = match parse_shader(&id, &source, path.display().to_string()) {
+            Ok(saver) => saver,
+            Err(err) => {
+                eprintln!("savethescreen: skipped {err}");
+                continue;
+            }
+        };
+        if let Some(existing) = savers.iter_mut().find(|item| item.id == saver.id) {
+            *existing = saver;
+        } else {
+            added.push(saver);
+        }
+    }
+    added.sort_by(|a, b| a.id.cmp(&b.id));
+    savers.extend(added);
+    savers
+}
+
+fn builtins() -> Vec<Saver> {
+    [
+        ("veil", include_str!("../shaders/veil.frag")),
+        ("drift", include_str!("../shaders/drift.frag")),
+        ("ember", include_str!("../shaders/ember.frag")),
+        ("bodies", include_str!("../shaders/bodies.frag")),
+        ("shoal", include_str!("../shaders/shoal.frag")),
+        ("gloam", include_str!("../shaders/gloam.frag")),
+        ("cinder", include_str!("../shaders/cinder.frag")),
+        ("murk", include_str!("../shaders/murk.frag")),
+        ("wisp", include_str!("../shaders/wisp.frag")),
+        ("silt", include_str!("../shaders/silt.frag")),
+    ]
+    .into_iter()
+    .map(|(id, source)| {
+        parse_shader(id, source, format!("built-in {id}")).expect("built-in shader")
+    })
+    .collect()
+}
+
+fn id_from_path(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    if name.starts_with('.') {
+        return None;
+    }
+    let lower = name.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".frag")?;
+    if stem.is_empty() {
+        return None;
+    }
+    Some(stem.to_string())
+}
+
+fn parse_shader(id: &str, source: &str, origin: String) -> Result<Saver, String> {
+    let source = source.strip_prefix('\u{feff}').unwrap_or(source);
+    if !source.contains("mainImage") {
+        return Err(format!(
+            "{origin}: a Shadertoy image shader needs mainImage"
+        ));
+    }
+    let (name, night, blurb) = card(source, id);
+    Ok(Saver {
+        id: id.to_string(),
+        name,
+        blurb,
+        night,
+        source: source.to_string(),
+        origin,
+    })
+}
+
+/// Leading `// name:`, `// night:`, and `// blurb:` lines. A Shadertoy paste
+/// with none of these still loads: the card title comes from the file name.
+fn card(source: &str, id: &str) -> (String, bool, String) {
+    let mut name = None;
+    let mut night = false;
+    let mut blurb = None;
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some(rest) = trimmed.strip_prefix("//") else {
+            break;
+        };
+        let Some((key, value)) = rest.trim().split_once(':') else {
+            continue;
+        };
+        match key.trim() {
+            "name" => {
+                let value = value.trim();
+                if !value.is_empty() {
+                    name = Some(value.to_string());
+                }
+            }
+            "blurb" => blurb = Some(value.trim().to_string()),
+            "night" => night = flag(value),
+            _ => {}
+        }
+    }
+    (
+        name.unwrap_or_else(|| title_from_id(id)),
+        night,
+        blurb.unwrap_or_default(),
+    )
+}
+
+fn flag(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "true" | "yes" | "1" | "night"
+    )
+}
+
+fn title_from_id(id: &str) -> String {
+    let mut words = Vec::new();
+    for word in id.split(|c: char| c == '-' || c == '_' || c == ' ') {
+        if word.is_empty() {
+            continue;
+        }
+        let mut chars = word.chars();
+        let Some(first) = chars.next() else {
+            continue;
+        };
+        let mut titled = first.to_uppercase().collect::<String>();
+        titled.push_str(chars.as_str());
+        words.push(titled);
+    }
+    if words.is_empty() {
+        id.to_string()
+    } else {
+        words.join(" ")
+    }
+}
+
+/// Vulkan GLSL around a Shadertoy image shader. `fragCoord` is bottom-left, matching Shadertoy.
+/// Naga packs `iTime` into the tail of the `iResolution` vec3. `Globals` in the renderer follows that.
+pub fn fragment_source(user: &str) -> String {
+    const PREAMBLE: &str = r#"#version 450
+layout(location = 0) out vec4 shadertoy_out;
+
+layout(std140, set = 0, binding = 0) uniform Shadertoy {
+    vec3 iResolution;
+    float iTime;
+    float iTimeDelta;
+    float iFrameRate;
+    int iFrame;
+    vec4 iMouse;
+    vec4 iDate;
+    float iSampleRate;
+};
+
+#define iGlobalTime iTime
+#define texture2D texture
+#define texture2DLod textureLod
+#define textureCube texture
+
+#line 1
+"#;
+    const EPILOGUE: &str = r#"
+void main() {
+    vec4 color = vec4(0.0, 0.0, 0.0, 1.0);
+    vec2 fragCoord = vec2(gl_FragCoord.x, iResolution.y - gl_FragCoord.y);
+    mainImage(color, fragCoord);
+    shadertoy_out = color;
+}
+"#;
+    let mut out = String::with_capacity(PREAMBLE.len() + user.len() + EPILOGUE.len() + 1);
+    out.push_str(PREAMBLE);
+    for line in user.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("#version") || trimmed.starts_with("precision ") {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(EPILOGUE);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folder_adds_and_replaces() {
+        let dir = std::env::temp_dir().join(format!("savethescreen-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("veil.frag"),
+            "// name: Custom Veil\n// night: true\n// blurb: Replaced.\nvoid mainImage(out vec4 fragColor, in vec2 fragCoord) {}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("harbor-lights.frag"),
+            "void mainImage(out vec4 fragColor, in vec2 fragCoord) {}\n",
+        )
+        .unwrap();
+        fs::write(dir.join("notes.txt"), "not a shader\n").unwrap();
+        fs::write(dir.join("broken.frag"), "void main() {}\n").unwrap();
+
+        let savers = load_from(&dir);
+        let veil = savers.iter().find(|saver| saver.id == "veil").unwrap();
+        assert_eq!(veil.name, "Custom Veil");
+        assert!(veil.night);
+        assert_eq!(veil.blurb, "Replaced.");
+        assert_eq!(savers.iter().position(|saver| saver.id == "veil"), Some(0));
+
+        let harbor = savers
+            .iter()
+            .find(|saver| saver.id == "harbor-lights")
+            .unwrap();
+        assert_eq!(harbor.name, "Harbor Lights");
+        assert!(!harbor.night);
+        assert!(harbor.blurb.is_empty());
+        assert!(
+            savers
+                .iter()
+                .position(|saver| saver.id == "harbor-lights")
+                .unwrap()
+                > savers.iter().position(|saver| saver.id == "silt").unwrap()
+        );
+        assert!(savers.iter().all(|saver| saver.id != "broken"));
+        assert!(savers.iter().all(|saver| saver.id != "notes"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wrapper_keeps_shadertoy_names() {
+        let source = fragment_source(
+            "#version 300 es\nprecision highp float;\nvoid mainImage(out vec4 fragColor, in vec2 fragCoord) {\n    fragColor = vec4(fragCoord / iResolution.xy, 0.0, 1.0);\n}\n",
+        );
+        assert!(source.contains("float iTime;"));
+        assert!(source.contains("vec4 iMouse;"));
+        assert!(source.contains("mainImage(color, fragCoord);"));
+        assert!(!source.contains("#version 300 es"));
+        assert!(!source.contains("precision highp float;"));
+        assert!(source.starts_with("#version 450"));
+    }
+}

@@ -1,11 +1,6 @@
-#version 450
-layout(location = 0) out vec4 o_color;
-
-layout(set = 0, binding = 0) uniform Globals {
-    vec2 u_res;
-    float u_time;
-    float _pad;
-};
+// name: Gloam
+// night: true
+// blurb: A dim twilight veil. Movement you notice after a breath.
 
 float hash(vec2 p) {
   return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
@@ -33,11 +28,11 @@ float fbm(vec2 p) {
   return v;
 }
 
-void main() {
-  vec2 uv = gl_FragCoord.xy / u_res.xy;
-  float aspect = u_res.x / u_res.y;
+void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+  vec2 uv = vec2(fragCoord.x / iResolution.x, 1.0 - fragCoord.y / iResolution.y);
+  float aspect = iResolution.x / iResolution.y;
   vec2 p = vec2(uv.x * aspect, uv.y);
-  float t = u_time * 0.045;
+  float t = iTime * 0.045;
 
   p += 0.05 * vec2(sin(t * 0.33), cos(t * 0.27));
 
@@ -47,7 +42,7 @@ void main() {
   vec2 sp = uv * vec2(70.0, 40.0) + vec2(t * 0.8, t * 0.35);
   float sh = hash(floor(sp));
   float star = smoothstep(0.03, 0.0, length(fract(sp) - 0.5)) * smoothstep(0.9, 0.99, sh);
-  star *= 0.4 + 0.6 * sin(u_time * (1.1 + sh * 2.4) + sh * 12.0);
+  star *= 0.4 + 0.6 * sin(iTime * (1.1 + sh * 2.4) + sh * 12.0);
   col += vec3(0.35, 0.4, 0.55) * star * 0.45;
 
   for (int k = 0; k < 3; k++) {
@@ -64,7 +59,7 @@ void main() {
     col += pal * curtain * (0.7 - fk * 0.1);
   }
 
-  col *= 0.9 + 0.1 * sin(u_time * 0.12 + uv.x * 2.0);
-  col += (hash(gl_FragCoord.xy + vec2(u_time * 9.0, u_time * 4.0)) - 0.5) * 0.015;
-  o_color = vec4(col, 1.0);
+  col *= 0.9 + 0.1 * sin(iTime * 0.12 + uv.x * 2.0);
+  col += (hash(vec2(fragCoord.x, iResolution.y - fragCoord.y) + vec2(iTime * 9.0, iTime * 4.0)) - 0.5) * 0.015;
+  fragColor = vec4(col, 1.0);
 }

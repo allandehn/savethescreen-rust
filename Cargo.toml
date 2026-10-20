@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 bytemuck = { version = "1", features = ["derive"] }
 glyphon = "0.12"
+libc = "0.2"
 pollster = "0.4"
 wgpu = { version = "30", features = ["glsl"] }
 winit = "0.30"

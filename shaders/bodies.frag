@@ -1,11 +1,6 @@
-#version 450
-layout(location = 0) out vec4 o_color;
-
-layout(set = 0, binding = 0) uniform Globals {
-    vec2 u_res;
-    float u_time;
-    float _pad;
-};
+// name: Bodies
+// night: false
+// blurb: Soft orbs on wandering paths, covering the whole rectangle.
 
 float hash(vec2 p) {
   return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
@@ -24,10 +19,10 @@ vec2 path(float i, float t) {
   );
 }
 
-void main() {
-  vec2 uv = gl_FragCoord.xy / u_res.xy;
-  float aspect = u_res.x / u_res.y;
-  float t = u_time * 0.2;
+void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+  vec2 uv = vec2(fragCoord.x / iResolution.x, 1.0 - fragCoord.y / iResolution.y);
+  float aspect = iResolution.x / iResolution.y;
+  float t = iTime * 0.2;
 
   vec2 field = uv * vec2(aspect, 1.0);
   float wash = 0.5 + 0.5 * sin(field.x * 1.6 + t * 0.4) * sin(field.y * 1.8 - t * 0.33);
@@ -50,6 +45,6 @@ void main() {
     col += pal * g * mag;
   }
 
-  col += (hash(gl_FragCoord.xy + vec2(u_time * 10.0, u_time * 4.0)) - 0.5) * 0.02;
-  o_color = vec4(col, 1.0);
+  col += (hash(vec2(fragCoord.x, iResolution.y - fragCoord.y) + vec2(iTime * 10.0, iTime * 4.0)) - 0.5) * 0.02;
+  fragColor = vec4(col, 1.0);
 }

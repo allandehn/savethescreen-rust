@@ -1,11 +1,6 @@
-#version 450
-layout(location = 0) out vec4 o_color;
-
-layout(set = 0, binding = 0) uniform Globals {
-    vec2 u_res;
-    float u_time;
-    float _pad;
-};
+// name: Shoal
+// night: false
+// blurb: Pool-floor light, constantly rewriting the highlights.
 
 float hash(vec2 p) {
   return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
@@ -20,11 +15,11 @@ float caustic(vec2 p, float t) {
   return pow(c, 4.2);
 }
 
-void main() {
-  vec2 uv = gl_FragCoord.xy / u_res.xy;
-  float aspect = u_res.x / u_res.y;
+void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+  vec2 uv = vec2(fragCoord.x / iResolution.x, 1.0 - fragCoord.y / iResolution.y);
+  float aspect = iResolution.x / iResolution.y;
   vec2 p = vec2(uv.x * aspect, uv.y);
-  float t = u_time * 0.48;
+  float t = iTime * 0.48;
 
   p += 0.05 * vec2(sin(t * 0.21), cos(t * 0.17));
 
@@ -44,6 +39,6 @@ void main() {
   col += rim * light * 0.8;
   col += sun * pow(light, 1.8) * 1.05;
 
-  col += (hash(gl_FragCoord.xy + vec2(u_time * 12.0, u_time * 6.0)) - 0.5) * 0.02;
-  o_color = vec4(col, 1.0);
+  col += (hash(vec2(fragCoord.x, iResolution.y - fragCoord.y) + vec2(iTime * 12.0, iTime * 6.0)) - 0.5) * 0.02;
+  fragColor = vec4(col, 1.0);
 }

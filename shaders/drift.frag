@@ -1,11 +1,6 @@
-#version 450
-layout(location = 0) out vec4 o_color;
-
-layout(set = 0, binding = 0) uniform Globals {
-    vec2 u_res;
-    float u_time;
-    float _pad;
-};
+// name: Drift
+// night: false
+// blurb: Ink in water. Filaments crawl so no region sits still.
 
 float hash(vec2 p) {
   return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
@@ -33,11 +28,11 @@ float fbm(vec2 p) {
   return v;
 }
 
-void main() {
-  vec2 uv = gl_FragCoord.xy / u_res.xy;
-  float aspect = u_res.x / u_res.y;
+void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+  vec2 uv = vec2(fragCoord.x / iResolution.x, 1.0 - fragCoord.y / iResolution.y);
+  float aspect = iResolution.x / iResolution.y;
   vec2 p = vec2(uv.x * aspect, uv.y) * 1.35;
-  float t = u_time * 0.038;
+  float t = iTime * 0.038;
 
   p += vec2(t * 0.17, -t * 0.11);
 
@@ -59,6 +54,6 @@ void main() {
   col = mix(col, rust, smoothstep(0.55, 0.9, n2) * 0.42);
   col *= 0.78 + 0.22 * n2;
 
-  col += (hash(gl_FragCoord.xy + vec2(u_time * 9.0, u_time * 5.0)) - 0.5) * 0.02;
-  o_color = vec4(col, 1.0);
+  col += (hash(vec2(fragCoord.x, iResolution.y - fragCoord.y) + vec2(iTime * 9.0, iTime * 5.0)) - 0.5) * 0.02;
+  fragColor = vec4(col, 1.0);
 }

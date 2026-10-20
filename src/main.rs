@@ -12,8 +12,8 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
-use render::{Renderer, Scene};
-use savers::SAVERS;
+use render::{FrameClock, Renderer, Scene};
+use savers::{shader_dir, Saver};
 
 const SAVER_FRAME: Duration = Duration::from_nanos(1_000_000_000 / 30);
 const GALLERY_FRAME: Duration = Duration::from_nanos(1_000_000_000 / 12);
@@ -73,14 +73,21 @@ impl Hud {
 struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
+    savers: Vec<Saver>,
+    shader_dir: String,
     mode: Mode,
     clock: Clock,
     hud: Hud,
     next_frame: Instant,
     cursor: (f32, f32),
+    pointer_down: bool,
+    /// False while the click that opened a saver is still held, so that click is not iMouse.
+    mouse_live: bool,
     cursor_shown: bool,
     occluded: bool,
     scroll: f32,
+    shader_frame: i32,
+    drawn_at: Instant,
 }
 
 impl App {
@@ -101,10 +108,26 @@ impl App {
 
     fn open_saver(&mut self, index: usize) {
         let Some(window) = &self.window else { return };
+        if index >= self.savers.len() {
+            return;
+        }
         self.mode = Mode::Saver(index);
+        self.mouse_live = !self.pointer_down;
         self.hud.poke(Duration::from_millis(4200));
-        window.set_title(&format!("{} · Save the Screen", SAVERS[index].name));
+        window.set_title(&format!("{} · Save the Screen", self.savers[index].name));
         window.request_redraw();
+    }
+
+    fn cycle(&mut self, delta: isize) {
+        let Mode::Saver(index) = self.mode else {
+            return;
+        };
+        let count = self.savers.len() as isize;
+        if count == 0 {
+            return;
+        }
+        let next = (index as isize + delta).rem_euclid(count) as usize;
+        self.open_saver(next);
     }
 
     fn toggle_fullscreen(&mut self) {
@@ -141,11 +164,12 @@ impl ApplicationHandler for App {
             attributes = attributes.with_name("savethescreen", "Save the Screen");
         }
         let window = Arc::new(event_loop.create_window(attributes).expect("create window"));
-        match Renderer::new(window.clone(), event_loop) {
+        match Renderer::new(window.clone(), event_loop, &mut self.savers) {
             Ok(renderer) => {
                 eprintln!(
-                    "savethescreen on {}. Savers draw at 30 fps with a 1600px long edge.",
-                    renderer.adapter_name
+                    "savethescreen on {}. Savers draw at 30 fps with a 1600px long edge. {} loaded.",
+                    renderer.adapter_name,
+                    self.savers.len()
                 );
                 self.renderer = Some(renderer);
                 self.window = Some(window);
@@ -213,13 +237,25 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                if button == winit::event::MouseButton::Left {
+                    self.pointer_down = state == ElementState::Pressed;
+                    if !self.pointer_down {
+                        self.mouse_live = true;
+                    }
+                }
                 if state != ElementState::Pressed || button != winit::event::MouseButton::Left {
                     return;
                 }
                 match self.mode {
                     Mode::Gallery => {
                         let (width, height) = logical_size(window);
-                        let layout = layout::gallery(width, height, self.scroll);
+                        let layout = layout::gallery(
+                            &self.savers,
+                            &self.shader_dir,
+                            width,
+                            height,
+                            self.scroll,
+                        );
                         self.scroll = layout.scroll;
                         if let Some(index) = layout.hit(self.cursor.0, self.cursor.1) {
                             self.open_saver(index);
@@ -234,7 +270,16 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state != ElementState::Pressed || event.repeat {
+                if event.state != ElementState::Pressed {
+                    return;
+                }
+                if let Some(delta) = arrow_delta(&event) {
+                    if matches!(self.mode, Mode::Saver(_)) {
+                        self.cycle(delta);
+                    }
+                    return;
+                }
+                if event.repeat {
                     return;
                 }
                 if is_gallery_key(&event) {
@@ -292,14 +337,25 @@ impl App {
             return;
         }
         let scale = window.scale_factor() as f32;
-        let logical = [
-            size.width as f32 / scale,
-            size.height as f32 / scale,
-        ];
+        let logical = [size.width as f32 / scale, size.height as f32 / scale];
         let time = self.clock.secs();
+        let now = Instant::now();
+        let delta = now
+            .saturating_duration_since(self.drawn_at)
+            .as_secs_f32()
+            .clamp(0.0, 0.1);
+        self.drawn_at = now;
+        let frame = self.shader_frame;
+        self.shader_frame = self.shader_frame.saturating_add(1);
         let scene = match self.mode {
             Mode::Gallery => {
-                let layout = layout::gallery(logical[0], logical[1], self.scroll);
+                let layout = layout::gallery(
+                    &self.savers,
+                    &self.shader_dir,
+                    logical[0],
+                    logical[1],
+                    self.scroll,
+                );
                 self.scroll = layout.scroll;
                 Scene::Gallery {
                     hover: layout.hit(self.cursor.0, self.cursor.1),
@@ -318,7 +374,20 @@ impl App {
         let Some(renderer) = &mut self.renderer else {
             return;
         };
-        renderer.draw(logical, scale, time, scene);
+        renderer.draw(
+            logical,
+            scale,
+            &FrameClock {
+                time,
+                delta,
+                frame,
+                pointer: [self.cursor.0, self.cursor.1],
+                pointer_down: self.pointer_down && self.mouse_live,
+            },
+            scene,
+            &self.savers,
+            &self.shader_dir,
+        );
         self.sync_cursor(show_cursor);
     }
 }
@@ -351,6 +420,14 @@ fn digit_index(key: PhysicalKey) -> Option<usize> {
     })
 }
 
+fn arrow_delta(event: &winit::event::KeyEvent) -> Option<isize> {
+    match event.logical_key {
+        Key::Named(NamedKey::ArrowRight) => Some(1),
+        Key::Named(NamedKey::ArrowLeft) => Some(-1),
+        _ => None,
+    }
+}
+
 fn is_gallery_key(event: &winit::event::KeyEvent) -> bool {
     if let PhysicalKey::Code(KeyCode::Backquote) = event.physical_key {
         return true;
@@ -367,6 +444,8 @@ fn main() {
     let mut app = App {
         window: None,
         renderer: None,
+        savers: savers::load(),
+        shader_dir: shader_dir().display().to_string(),
         mode: Mode::Gallery,
         clock: Clock {
             epoch: Instant::now(),
@@ -379,8 +458,12 @@ fn main() {
         },
         next_frame: Instant::now(),
         cursor: (0.0, 0.0),
+        pointer_down: false,
+        mouse_live: true,
         cursor_shown: true,
         occluded: false,
+        shader_frame: 0,
+        drawn_at: Instant::now(),
     };
     event_loop.run_app(&mut app).expect("run");
 }

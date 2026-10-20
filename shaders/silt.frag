@@ -1,11 +1,6 @@
-#version 450
-layout(location = 0) out vec4 o_color;
-
-layout(set = 0, binding = 0) uniform Globals {
-    vec2 u_res;
-    float u_time;
-    float _pad;
-};
+// name: Silt
+// night: true
+// blurb: Deep water at night. Faint caustics and motes, barely there.
 
 float hash(vec2 p) {
   return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
@@ -19,11 +14,11 @@ float caustic(vec2 p, float t) {
   return pow(c, 4.0);
 }
 
-void main() {
-  vec2 uv = gl_FragCoord.xy / u_res.xy;
-  float aspect = u_res.x / u_res.y;
+void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+  vec2 uv = vec2(fragCoord.x / iResolution.x, 1.0 - fragCoord.y / iResolution.y);
+  float aspect = iResolution.x / iResolution.y;
   vec2 p = vec2(uv.x * aspect, uv.y);
-  float t = u_time * 0.32;
+  float t = iTime * 0.32;
 
   p += 0.04 * vec2(sin(t * 0.19), cos(t * 0.15));
 
@@ -44,7 +39,7 @@ void main() {
   float spec = smoothstep(0.04, 0.0, length(fract(mote) - 0.5)) * smoothstep(0.93, 0.995, mh);
   col += vec3(0.18, 0.28, 0.26) * spec * 0.5;
 
-  col *= 0.9 + 0.1 * sin(u_time * 0.12 + uv.x * 1.7);
-  col += (hash(gl_FragCoord.xy + vec2(u_time * 11.0, u_time * 5.0)) - 0.5) * 0.015;
-  o_color = vec4(col, 1.0);
+  col *= 0.9 + 0.1 * sin(iTime * 0.12 + uv.x * 1.7);
+  col += (hash(vec2(fragCoord.x, iResolution.y - fragCoord.y) + vec2(iTime * 11.0, iTime * 5.0)) - 0.5) * 0.015;
+  fragColor = vec4(col, 1.0);
 }

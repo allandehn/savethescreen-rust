@@ -1,6 +1,1 @@
 /target
-
-# Local copy of the HTML gallery. That project has its own repo.
-/*.html
-/css/
-/js/

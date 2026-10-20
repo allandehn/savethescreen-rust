@@ -1,4 +1,4 @@
-use crate::savers::SAVERS;
+use crate::savers::Saver;
 
 pub const BG: [f32; 4] = hex(0x12110e, 1.0);
 pub const RAISE: [f32; 4] = hex(0x1b1914, 1.0);
@@ -74,7 +74,7 @@ impl Layout {
     }
 }
 
-pub fn gallery(win_w: f32, win_h: f32, scroll: f32) -> Layout {
+pub fn gallery(savers: &[Saver], shader_dir: &str, win_w: f32, win_h: f32, scroll: f32) -> Layout {
     let cols: usize = if win_w <= 760.0 {
         1
     } else if win_w <= 1280.0 {
@@ -87,18 +87,22 @@ pub fn gallery(win_w: f32, win_h: f32, scroll: f32) -> Layout {
     let x0 = (win_w - content_w) * 0.5;
     let gap = 14.4;
     let card_w = (content_w - gap * (cols as f32 - 1.0)) / cols as f32;
-    let aspect = if win_w <= 760.0 { 16.0 / 10.0 } else { 4.0 / 5.0 };
+    let aspect = if win_w <= 760.0 {
+        16.0 / 10.0
+    } else {
+        4.0 / 5.0
+    };
     let card_h = card_w / aspect;
     let wide = win_w > 1280.0;
     let title_size = (win_w * 0.046).clamp(38.0, 70.0);
 
-    let day: Vec<usize> = SAVERS
+    let day: Vec<usize> = savers
         .iter()
         .enumerate()
         .filter(|(_, saver)| !saver.night)
         .map(|(i, _)| i)
         .collect();
-    let night: Vec<usize> = SAVERS
+    let night: Vec<usize> = savers
         .iter()
         .enumerate()
         .filter(|(_, saver)| saver.night)
@@ -115,7 +119,21 @@ pub fn gallery(win_w: f32, win_h: f32, scroll: f32) -> Layout {
     } else {
         22.0 + title_size + 12.0 + lede_h + 16.0
     };
-    let content_h = header_h + group_h(day.len()) + 40.0 + group_h(night.len()) + 96.0;
+    let footer_h = 168.0;
+    let mut content_h = header_h;
+    if !day.is_empty() {
+        content_h += group_h(day.len());
+    }
+    if !night.is_empty() {
+        if !day.is_empty() {
+            content_h += 22.0;
+        }
+        content_h += 26.0 + group_h(night.len());
+    }
+    if day.is_empty() && night.is_empty() {
+        content_h += 48.0;
+    }
+    content_h += 22.0 + footer_h;
     // A tiled window is often shorter than two groups of cards. Scroll instead of clipping Night.
     let max_scroll = (content_h + 32.0 - win_h).max(0.0);
     let scroll = if max_scroll == 0.0 {
@@ -133,18 +151,14 @@ pub fn gallery(win_w: f32, win_h: f32, scroll: f32) -> Layout {
     let mut rects = Vec::new();
     let mut cards = Vec::new();
 
+    let count = savers.len();
+    let kicker = if count == 1 {
+        "1 FULLSCREEN SAVER".to_string()
+    } else {
+        format!("{count} FULLSCREEN SAVERS")
+    };
     texts.push(run(
-        "TEN FULLSCREEN SAVERS",
-        x0,
-        y,
-        content_w,
-        11.5,
-        16.0,
-        AMBER,
-        false,
-        false,
-        0.18,
-        None,
+        &kicker, x0, y, content_w, 11.5, 16.0, AMBER, false, false, 0.18, None,
     ));
     texts.push(run(
         "Save the Screen",
@@ -203,47 +217,46 @@ pub fn gallery(win_w: f32, win_h: f32, scroll: f32) -> Layout {
         mode: 0.0,
     });
 
-    y = place_group(
-        &day,
-        x0,
-        y,
-        cols,
-        card_w,
-        card_h,
-        gap,
-        &mut cards,
-        &mut texts,
-    );
-    y += 22.0;
-    texts.push(run(
-        "NIGHT",
-        x0,
-        y,
-        content_w,
-        11.5,
-        16.0,
-        AMBER,
-        false,
-        false,
-        0.18,
-        None,
-    ));
-    y += 26.0;
-    y = place_group(
-        &night,
-        x0,
-        y,
-        cols,
-        card_w,
-        card_h,
-        gap,
-        &mut cards,
-        &mut texts,
-    );
+    if day.is_empty() && night.is_empty() {
+        texts.push(run(
+            "No savers loaded.",
+            x0,
+            y,
+            content_w,
+            16.5,
+            24.0,
+            MUTED,
+            false,
+            false,
+            0.0,
+            None,
+        ));
+        y += 48.0;
+    }
+    if !day.is_empty() {
+        y = place_group(
+            savers, &day, x0, y, cols, card_w, card_h, gap, &mut cards, &mut texts,
+        );
+    }
+    if !night.is_empty() {
+        if !day.is_empty() {
+            y += 22.0;
+        }
+        texts.push(run(
+            "NIGHT", x0, y, content_w, 11.5, 16.0, AMBER, false, false, 0.18, None,
+        ));
+        y += 26.0;
+        y = place_group(
+            savers, &night, x0, y, cols, card_w, card_h, gap, &mut cards, &mut texts,
+        );
+    }
 
     y += 22.0;
+    let footer = format!(
+        "This panel is IPS Black, so OLED-style burn-in is unlikely — a bright static window can still leave a faint afterimage. Every pixel here keeps moving, plus a slow whole-frame wander. Open a card, then click or press F for fullscreen. Keys 1–0 jump to a saver, the arrow keys move through the list, and ½ returns here. A new saver is a Shadertoy .frag file in {shader_dir}: start the app again and it joins the shelf."
+    );
     texts.push(run(
-        "This panel is IPS Black, so OLED-style burn-in is unlikely — a bright static window can still leave a faint afterimage. Every pixel here keeps moving, plus a slow whole-frame wander. Open a card, then click or press F for fullscreen. Keys 1–0 jump between versions. ½ returns to this gallery — the same key as the Quake console.",
+        &footer,
         x0,
         y,
         content_w.min(760.0),
@@ -265,6 +278,7 @@ pub fn gallery(win_w: f32, win_h: f32, scroll: f32) -> Layout {
 }
 
 fn place_group(
+    savers: &[Saver],
     indices: &[usize],
     x0: f32,
     mut y: f32,
@@ -280,7 +294,7 @@ fn place_group(
         let row = (indices.len() - placed).min(cols);
         for col in 0..row {
             let index = indices[placed + col];
-            let saver = &SAVERS[index];
+            let saver = &savers[index];
             let x = x0 + col as f32 * (card_w + gap);
             cards.push(CardGeom {
                 index,
@@ -294,13 +308,18 @@ fn place_group(
             let name_size = (card_w * 0.105).clamp(20.0, 26.0);
             let body_size = 14.0;
             let chars_per_line = ((card_w - pad * 2.0) / (body_size * 0.52)).max(10.0);
-            let lines = (saver.blurb.chars().count() as f32 / chars_per_line)
-                .ceil()
-                .clamp(1.0, 4.0);
+            let lines = if saver.blurb.is_empty() {
+                0.0
+            } else {
+                (saver.blurb.chars().count() as f32 / chars_per_line)
+                    .ceil()
+                    .clamp(1.0, 4.0)
+            };
             let block = 16.0 + 4.0 + name_size + 4.0 + lines * 18.0;
             let mut ty = y + card_h - pad - block;
+            let number = format!("{:02}", index + 1);
             texts.push(run(
-                saver.number,
+                &number,
                 x + pad,
                 ty,
                 card_w - pad * 2.0,
@@ -314,7 +333,7 @@ fn place_group(
             ));
             ty += 16.0;
             texts.push(run(
-                saver.name,
+                &saver.name,
                 x + pad,
                 ty,
                 card_w - pad * 2.0,
@@ -327,19 +346,21 @@ fn place_group(
                 clip,
             ));
             ty += name_size + 2.0;
-            texts.push(run(
-                saver.blurb,
-                x + pad,
-                ty,
-                card_w - pad * 2.0,
-                body_size,
-                18.0,
-                INK_SOFT,
-                false,
-                false,
-                0.0,
-                clip,
-            ));
+            if !saver.blurb.is_empty() {
+                texts.push(run(
+                    &saver.blurb,
+                    x + pad,
+                    ty,
+                    card_w - pad * 2.0,
+                    body_size,
+                    18.0,
+                    INK_SOFT,
+                    false,
+                    false,
+                    0.0,
+                    clip,
+                ));
+            }
         }
         placed += row;
         y += card_h + gap;
@@ -347,17 +368,17 @@ fn place_group(
     y - gap
 }
 
-pub fn hud(index: usize, win_w: f32, win_h: f32) -> Vec<TextRun> {
-    let saver = &SAVERS[index];
+pub fn hud(savers: &[Saver], index: usize, win_w: f32, win_h: f32) -> Vec<TextRun> {
+    let saver = &savers[index];
     let left = 28.0;
-    let width = (win_w - left * 2.0).min(560.0);
+    let width = (win_w - left * 2.0).min(640.0);
     let title_size = (win_w * 0.04).clamp(32.0, 50.0);
     let hint_y = win_h - 36.0;
     let title_y = hint_y - 10.0 - title_size;
     let brand_y = title_y - 22.0;
     vec![
         run(
-            &format!("SAVE THE SCREEN  ·  {} OF 10", index + 1),
+            &format!("SAVE THE SCREEN  ·  {} OF {}", index + 1, savers.len()),
             left,
             brand_y,
             width,
@@ -370,7 +391,7 @@ pub fn hud(index: usize, win_w: f32, win_h: f32) -> Vec<TextRun> {
             None,
         ),
         run(
-            saver.name,
+            &saver.name,
             left,
             title_y,
             width,
@@ -383,7 +404,7 @@ pub fn hud(index: usize, win_w: f32, win_h: f32) -> Vec<TextRun> {
             None,
         ),
         run(
-            "Click or press F for fullscreen  ·  1–0 to switch  ·  ½ back to the gallery",
+            "Click or press F for fullscreen  ·  arrows or 1–0 to switch  ·  ½ back to the gallery",
             left,
             hint_y,
             width,
